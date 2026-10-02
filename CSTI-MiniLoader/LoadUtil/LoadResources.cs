@@ -5,8 +5,9 @@ using CSTI_MiniLoader.LoadUtil.DataFind;
 using CSTI_MiniLoader.Patchers;
 using CSTI_MiniLoader.WarpperClassGen;
 using MelonLoader;
-using UnhollowerBaseLib;
-using UnhollowerRuntimeLib;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
+using Il2CppInterop.Runtime.InteropTypes;
+using Il2CppInterop.Runtime;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
@@ -71,8 +72,44 @@ public static class LoadResources
         }
     }
 
+    /// <summary>
+    /// 免 FindObjectsOfType 版本的资源注册。
+    /// 原版用 Object.FindObjectsOfType(ScriptableObject)，但那条链路内部依赖
+    /// UnityEngine.Resources::FindObjectsOfTypeAll —— 本机引擎里该 ICall 未注册，必然抛异常，
+    /// 导致游戏资源注册表从未建立、mod 内容（卡牌/特质）永远不会出现。
+    /// 改用游戏自己维护的 UniqueIDScriptable.AllUniqueObjects 静态字典（纯托管，无 ICall 依赖），
+    /// 由 Pump 轮询驱动：字典一有内容就注册。
+    /// </summary>
+    public static bool LoadGameResourceFromRegistry()
+    {
+        try
+        {
+            var dict = UniqueIDScriptable.AllUniqueObjects;
+            if (dict == null || dict.Count == 0) return false;
+
+            int n = 0;
+            foreach (var kv in dict)
+            {
+                var obj = kv.Value;
+                if (obj == null) continue;
+                RegObj(kv.Key, obj, obj.GetType());
+                n++;
+            }
+            MelonLogger.Msg("[HOOKFREE] 资源注册表导入完成: " + n + " 个对象（原版 FindObjectsOfType 路径不可用）");
+            return n > 0;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Error("LoadGameResourceFromRegistry Error " + ex.Message);
+            return false;
+        }
+    }
+
     public static void LoadGameResource()
     {
+        // 优先走游戏自己的注册表（原版路径依赖被裁剪的 ICall，必然失败）
+        if (LoadGameResourceFromRegistry()) return;
+
         try
         {
             foreach (var ele in Object.FindObjectsOfType(Il2CppType.Of<ScriptableObject>()).WithGameDataFinder())
@@ -98,6 +135,14 @@ public static class LoadResources
     {
         // var bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
         var keys = WaitForWarpperEditorGuidDict.Keys.ToList();
+        // 计数必须放在 try 里面各自的位置上（上一版把 ok++ 写在 catch 里，得出「成功=0 失败=0」的假结论）
+        int jsonNull = 0, warped = 0, exCount = 0;
+        int perkSeen = 0, perkQueued = 0, perkNoGroupKey = 0;
+        int perkGroupSeen = 0;
+        var loggedTypes = new HashSet<string>();
+        WarpFunc.ResetStats();
+        // 事件卡诊断（见下方 [EVENTCARD]）：最多转储 4 张
+        var eventCardDumped = 0;
         foreach (var key in keys)
         {
             try
@@ -106,8 +151,29 @@ public static class LoadResources
                 WaitForWarpperEditorGuidDict.Remove(key);
 
                 var json = processingScriptableObjectPack.CardData;
-                if (json == null) continue;
+                if (json == null)
+                {
+                    jsonNull++;
+                    if (jsonNull <= 3) MelonLogger.Warning("[WARP] json 为空: " + key);
+                    continue;
+                }
+
+                warped++;
                 WarpFunc.JsonCommonWarpper(processingScriptableObjectPack.Obj, json);
+
+                // 每种类型只打一次：json 字段数 vs 生成器字段数（gen=0 说明 warp 会把所有键静默跳过）
+                var tname = Diag.Cls(processingScriptableObjectPack.Obj);
+                if (loggedTypes.Add(tname))
+                {
+                    var genFields = -1;
+                    try { genFields = MainGen.GetOrGen(processingScriptableObjectPack.Obj.GetType()).Count; } catch { }
+                    var sampleKeys = string.Join(",", json.Keys.Take(6));
+                    MelonLogger.Msg("[WARP] 首见类型 " + tname + " json字段=" + json.Count + " gen字段=" + genFields
+                                    + " 例键=[" + sampleKeys + "] il2cpp类=" + tname);
+                }
+
+                if (tname == "PerkGroup" && perkGroupSeen++ < 2)
+                    Diag.DumpJson("PerkGroup " + Diag.NameOf(processingScriptableObjectPack.Obj), json, 12);
                 if (processingScriptableObjectPack.Obj is CardData cardData)
                 {
                     if (cardData.CardType == CardTypes.Blueprint &&
@@ -138,6 +204,42 @@ public static class LoadResources
                                     json["CardDataCardFilterGroup"][i].ToString(), cardData));
 
                     cardData.FillDropsList();
+                    // [诊断] 用户报「开局事件选选项没给东西」，存档里 EncounteredEvents 只有
+                    // Windy_Event_Gift —— 说明那个事件是 mod 卡。这里把事件类卡片的 JSON 键与
+                    // warp 后的关键字段打出来，看「选项/结果」数据到底有没有进来。
+                    try
+                    {
+                        var nm = Diag.NameOf(cardData);
+                        var isEventName = nm.IndexOf("Event", StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (eventCardDumped < 8 && (isEventName || eventCardDumped < 2))
+                        {
+                            eventCardDumped++;
+                            Diag.EventCardDumps++;
+                            // [lean] 只打一行汇总（条数 + 产物链是否完整）；[full] 打 JSON 全量 + 逐字段明细
+                            if (!MiniLoader.DiagFull)
+                            {
+                                Diag.LogEventCardSummary(cardData, nm, json);
+                            }
+                            else
+                            {
+                                MelonLogger.Msg("[EVENTCARD] " + nm + " GUID=" + Diag.SafeUniqueId(cardData)
+                                                + " json键数=" + json.Count + (isEventName ? "  <名字含Event>" : ""));
+                                MelonLogger.Msg("[EVENTCARD]   CardInteractions=" + Diag.Render(cardData.CardInteractions)
+                                                + " CardTags=" + Diag.Render(cardData.CardTags)
+                                                + " AllDrops=" + Diag.Render(cardData.AllDrops));
+                                Diag.DumpJson("EVENTCARD " + nm, json, 130);
+                                // [C 判据] CardTags 是否被「按名字」解析成非空数组
+                                Diag.DumpNamedArray(cardData, "CardTags", "EVENTCARD " + nm);
+                                // [正向判据] 事件选项的产出链：DismantleActions[i].ActionName + ProducedCards[0]
+                                Diag.DumpEffectArray(cardData, "DismantleActions",
+                                    "EVENTCARD " + nm + " GUID=" + Diag.SafeUniqueId(cardData)?.Substring(0, 8));
+                            }
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("[EVENTCARD] 转储失败: " + e.GetType().Name + " " + e.Message);
+                    }
                     // var FillDropsList = typeof(CardData).GetMethod("FillDropsList", bindingFlags);
                     // if (FillDropsList != null)
                     // {
@@ -146,10 +248,26 @@ public static class LoadResources
                 }
                 else if (processingScriptableObjectPack.Obj is CharacterPerk perk)
                 {
+                    perkSeen++;
+                    MiniLoader.ModPerks.Add(perk);   // 收集起来，稍后挂进 PerkTabGroup.ContainedPerks
+                    if (perkSeen <= 2) Diag.DumpJson("CharacterPerk#" + perkSeen + " " + Diag.NameOf(perk), json, 45);
                     if (json.ContainsKey("CharacterPerkPerkGroup") && json["CharacterPerkPerkGroup"].IsString &&
                         !string.IsNullOrWhiteSpace(json["CharacterPerkPerkGroup"].ToString()))
-                        WaitForAddPerkGroup.Add(new Tuple<string, CharacterPerk>(
-                            json["CharacterPerkPerkGroup"].ToString(), perk));
+                    {
+                        var wantGroup = json["CharacterPerkPerkGroup"].ToString();
+                        WaitForAddPerkGroup.Add(new Tuple<string, CharacterPerk>(wantGroup, perk));
+                        perkQueued++;
+                        if (perkQueued <= 8)
+                            MelonLogger.Msg("[PERK] 待挂特质: 组=\"" + wantGroup + "\" 特质对象名=" + Diag.NameOf(perk)
+                                            + " GUID=" + Diag.SafeUniqueId(perk));
+                    }
+                    else
+                    {
+                        perkNoGroupKey++;
+                        if (perkNoGroupKey <= 5)
+                            MelonLogger.Warning("[PERK] 特质 JSON 里没有 CharacterPerkPerkGroup: " + Diag.NameOf(perk)
+                                                + " 键=[" + string.Join(",", json.Keys.Take(12)) + "]");
+                    }
                 }
                 else if (processingScriptableObjectPack.Obj is GameStat stat)
                 {
@@ -176,9 +294,19 @@ public static class LoadResources
             }
             catch (Exception ex)
             {
+                exCount++;
+                if (exCount <= 5)
+                    MelonLogger.Warning("[WARP异常] key=" + key + " " + ex.GetType().Name + ": " + ex.Message
+                                        + "\n" + (ex.StackTrace ?? "").Split('\n').FirstOrDefault());
                 Debug.LogWarning("WarpperAllEditorMods " + ex.Message);
             }
         }
+
+        MelonLogger.Msg("[WARP统计] 处理=" + keys.Count + " json空=" + jsonNull + " 已warp=" + warped
+                        + " 异常=" + exCount + " | " + WarpFunc.StatLine());
+        MelonLogger.Msg("[PERK统计] CharacterPerk=" + perkSeen + " 有组名=" + perkQueued
+                        + " 缺组名键=" + perkNoGroupKey + " 待挂载队列=" + WaitForAddPerkGroup.Count);
+        WarpFunc.DumpSamples();
 
         LoadPatchMain.OnceWarp = true;
     }

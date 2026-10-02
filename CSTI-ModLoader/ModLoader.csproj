@@ -43,7 +43,7 @@ $(OutputPath)LitJSON.dll;$(OutputPath)ModLoader.dll;更新历史.txt" />
         <WarningLevel>4</WarningLevel>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <OutputPath1>..\..\my-cstimods\ModLoader</OutputPath1>
-        <OutputPath2>D:\SteamLibrary\steamapps\common\Card Survival Tropical Island\BepInEx\plugins\ModLoader</OutputPath2>
+<!--        <OutputPath2>D:\SteamLibrary\steamapps\common\Card Survival Tropical Island\BepInEx\plugins\ModLoader</OutputPath2>-->
     </PropertyGroup>
     <ItemGroup>
         <Compile Include="Compatible\CompatibleCheck.cs" />
@@ -246,7 +246,7 @@ $(OutputPath)LitJSON.dll;$(OutputPath)ModLoader.dll;更新历史.txt" />
           <HintPath>..\packages\System.Xml.ReaderWriter.4.3.0\lib\net46\System.Xml.ReaderWriter.dll</HintPath>
         </Reference>
         <Reference Include="Unity.TextMeshPro">
-            <HintPath>..\..\..\..\SteamLibrary\steamapps\common\Card Survival Tropical Island\Card Survival - Tropical Island_Data\Managed\Unity.TextMeshPro.dll</HintPath>
+            <HintPath>D:\Program Files (x86)\Steam\steamapps\common\Card Survival Tropical Island\Card Survival - Tropical Island_Data\Managed\Unity.TextMeshPro.dll</HintPath>
             <Private>False</Private>
         </Reference>
         <Reference Include="UnityEngine">

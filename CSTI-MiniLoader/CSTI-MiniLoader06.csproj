@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    CSTI-MiniLoader —— MelonLoader 0.6.5 / .NET 8 / Il2CppInterop 移植版
+    原始工程：D:\RiderProjects\CSTI-ModLoader\CSTI-MiniLoader（net472 + Unhollower，只读参考）
+
+    构建：
+      dotnet build -c Release -p:ML06=D:\RiderProjects\ml-installer-06
+    产物：
+      bin\Release\CSTI-MiniLoader.dll（+ LitJSON.dll / LZ4.dll / NAudio.dll，见 UserLibs 说明）
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>CSTI-MiniLoader</AssemblyName>
+    <RootNamespace>CSTI_MiniLoader</RootNamespace>
+    <Version>0.0.2</Version>
+    <LangVersion>latest</LangVersion>
+    <!-- annotations：允许 string? 等注解，但不产出可空性告警（原工程为 Nullable=enable） -->
+    <Nullable>annotations</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <DefineConstants>TRACE;MELON_LOADER</DefineConstants>
+    <NoWarn>CS0618;CS0108;CS0114;CS0162;CS0168;CS0219;CS8632;CS0649</NoWarn>
+  </PropertyGroup>
+
+  <!-- MelonLoader 0.6 运行时 -->
+  <ItemGroup>
+    <Reference Include="MelonLoader">
+      <HintPath>$(ML06)\mldata\MelonLoader\net8\MelonLoader.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(ML06)\mldata\MelonLoader\net8\0Harmony.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(ML06)\mldata\MelonLoader\net8\Il2CppInterop.Runtime.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- 游戏代理程序集（Il2CppInterop 生成，0.5.7 命名风格 OptIn） -->
+  <ItemGroup>
+    <Reference Include="$(ML06)\interop_out\*.dll">
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- 第三方依赖：编译期引用；运行期必须放到 MelonLoader 的 UserLibs 目录（见 userlibs/README.txt） -->
+  <ItemGroup>
+    <PackageReference Include="LitJson" Version="0.19.0" />
+    <PackageReference Include="lz4net" Version="1.0.15.93" />
+    <PackageReference Include="NAudio" Version="1.10.0" />
+  </ItemGroup>
+
+  <!-- tools\ 下是离线冒烟测试工程（独立 csproj），不参与 mod 本体编译 -->
+  <ItemGroup>
+    <Compile Remove="tools\**" />
+    <None Remove="tools\**" />
+  </ItemGroup>
+
+</Project>
