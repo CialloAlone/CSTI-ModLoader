@@ -1035,12 +1035,23 @@ public static class Diag
     {
         if (before == null || before.Count == 0) return;
         int sizeChanged = 0, contentChanged = 0, lost = 0;
+        int skippedIntentional = 0;
         long sumBefore = 0, sumAfter = 0;
         var samples = new System.Collections.Generic.List<string>();
         foreach (var kv in before)
         {
             sumBefore += kv.Value.Size;
             var parts = kv.Key.Split('|');
+
+            // [2026-10-03] GSM 有意改造的游戏卡牌属于"有意的数据变更"，从污染判据排除，
+            // 由 [GSM] 清单单独列出 —— 这样"有意改动"与"意外污染"分得清。
+            if (parts.Length > 1 && IntentionalGuids.Contains(parts[1]))
+            {
+                skippedIntentional++;
+                GsmSampleHit++;
+                continue;
+            }
+
             var ok = false;
             long size = -1, content = -1;
             string detail = null;
@@ -1082,6 +1093,7 @@ public static class Diag
         MelonLogger.Msg("[INVARIANT] " + tag + " 游戏对象（尺寸/内容/丢失）: 尺寸变化=" + sizeChanged
                         + " 内容变化=" + contentChanged + " 丢失=" + lost + " / 共 " + before.Count
                         + "（尺寸总和 " + sumBefore + "→" + sumAfter + "）"
+                        + "；GSM 有意修改目标总数=" + IntentionalGuids.Count + "，其中落在本次采样内=" + skippedIntentional + "（已排除）"
                         + ((sizeChanged + contentChanged + lost) == 0
                             ? " ✓ 尺寸与内容均完全不变"
                             : " 样本: " + string.Join(" | ", samples)));
@@ -1930,6 +1942,858 @@ public static class Diag
             return -1;
         }
     }
+    /// <summary>
+    /// 按 interop 类型新建一个实例（`il2cpp_object_new` + 包装）—— 给"warp 需要**追加一个对象元素**"用
+    /// （GameSourceModify 的 `*WarpData` 元素是完整对象；普通类型不是 ScriptableObject，走不了 CreateScriptableObject 通道）。
+    /// </summary>
+    public static object NewElementOf(Type t)
+    {
+        if (t == null) return null;
+        try
+        {
+            var cls = NativeClassOf(t);
+            if (cls == IntPtr.Zero) cls = FindClassPtrByClassName(t.Name);   // 兜底：从同类现成实例借类
+            if (cls == IntPtr.Zero) return null;
+            var ptr = IL2CPP.il2cpp_object_new(cls);
+            if (ptr == IntPtr.Zero) return null;
+            return Activator.CreateInstance(t, new object[] { ptr });
+        }
+        catch
+        {
+            return null;
+        }
+    }
+    /// <summary>
+    /// 把一个**引用字段**指向某个现成对象（优先走生成的属性 setter，失败则按字段偏移 + 写屏障）。
+    /// 用于"嵌套子对象为 null → 先建出来再递归 warp"（例如新增元素的 `ProducedCards`，它是一个
+    /// `CardsDropCollection`，不建出来就永远是空的 —— 空动作的另一半原因）。
+    /// </summary>
+    public static bool SetObjectField(object host, string fld, object value)
+    {
+        try
+        {
+            if (host == null || value == null) return false;
+            var p = host.GetType().GetProperty(fld);
+            if (p != null && p.CanWrite)
+            {
+                p.SetValue(host, value);
+                RefFieldSet++;
+                return true;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (host is Il2CppObjectBase hb && value is Il2CppObjectBase vb)
+            {
+                var gen = WarpperClassGen.MainGen.GetOrGen(host.GetType());
+                if (gen.TryGetValue(fld, out var tuple))
+                {
+                    var hp = hb.Pointer;
+                    Il2CppInterop.Runtime.IL2CPP.il2cpp_gc_wbarrier_set_field(hp, hp + tuple.fOffset, vb.Pointer);
+                    RefFieldSet++;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        if (RefFieldFailSamples.Count < 10)
+            RefFieldFailSamples.Add(host.GetType().Name + "." + fld);
+        RefFieldFail++;
+        return false;
+    }
+
+    public static int RefFieldSet, RefFieldFail;
+    public static readonly List<string> RefFieldFailSamples = new();
+    // ═══════════ 调用来源追踪（定位"谁重建了数组"） ═══════════
+    /// <summary>当前阶段标记（反序列化 / 只解引用 / MODIFY就地改 / 新建元素追加 …）。</summary>
+    public static string CurrentPhase = "初始";
+
+    /// <summary>最近一次"对象元素数组"调用的来源（函数 + 前 3 帧）。</summary>
+    public static string LastArrayCallSite = "?";
+
+    /// <summary>取调用栈前 N 帧的方法名（诊断"到底谁触发了这次重建"）。</summary>
+    public static string Frames(int n = 3)
+    {
+        try
+        {
+            var st = new System.Diagnostics.StackTrace(1, false);
+            var parts = new List<string>();
+            for (var i = 0; i < st.FrameCount && parts.Count < n; i++)
+            {
+                var m = st.GetFrame(i)?.GetMethod();
+                if (m == null) continue;
+                parts.Add(m.DeclaringType?.Name + "." + m.Name);
+            }
+
+            return string.Join(" ← ", parts);
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+    // ═══════════ 新增/就地改元素的「反序列化 + 三行证据」（Lead 指定） ═══════════
+    public static int DeserOk, DeserFail;
+    private static int DeserEvidenceLogged;
+
+    /// <summary>
+    /// 给"新建/就地改"的对象元素填字段：**无条件先走已确认可用的 ICall**
+    /// `UnityEngine.JsonUtility::FromJsonInternal`（纯 ICall、零裸内存、不受任何开关门控），
+    /// 失败才退回托管 `FromJsonOverwrite`。并按 Lead 要求打**三行证据**：
+    /// ① json 前 300 字符 ② `il2cpp_class_get_type` 拿到的类名 ③ 调用后**立刻读回** `ActionName.DefaultText`。
+    /// </summary>
+    public static void DeserializeElement(Il2CppObjectBase target, KVProvider json, string how)
+    {
+        try
+        {
+            if (target == null || json == null) return;
+            var savedPhase = CurrentPhase;
+            CurrentPhase = "反序列化(" + how + ")";
+            var elJson = json.ToJson();
+            var ptr = target.Pointer;
+            var clsName = AsciiClassName(ptr);
+            var before = ReadName(target);
+
+            var ok = FromJsonViaIcall(elJson, target);
+            var after = ReadName(target);
+
+            if (DeserEvidenceLogged < 6)
+            {
+                DeserEvidenceLogged++;
+                MelonLogger.Msg("[DESER] " + how + " 元素类型=" + clsName
+                                + " | ①json前300=" + (elJson.Length > 300 ? elJson.Substring(0, 300) : elJson));
+                MelonLogger.Msg("[DESER] " + how + " ②il2cpp类=" + clsName
+                                + " ③调用后立即读回 ActionName.DefaultText=\"" + after + "\"（调用前=\"" + before + "\"）"
+                                + " ICall=" + ok);
+            }
+
+            if (ok && after == before && !string.IsNullOrEmpty(after) == false && after.Length == 0)
+            {
+                // ICall 成功但没写进去 → 用托管版再试一次（异常原文照打）
+                try
+                {
+                    UnityEngine.JsonUtility.FromJsonOverwrite(elJson, target.Cast<Il2CppSystem.Object>());
+                    var again = ReadName(target);
+                    if (DeserEvidenceLogged < 8)
+                    {
+                        DeserEvidenceLogged++;
+                        MelonLogger.Msg("[DESER] 托管版兜底后读回 ActionName.DefaultText=\"" + again + "\"");
+                    }
+                }
+                catch (Exception de)
+                {
+                    if (DeserFail < 5)
+                        MelonLogger.Warning("[DESER] 托管版反序列化**抛异常**: " + de.GetType().Name + " " + de.Message);
+                }
+            }
+
+            CurrentPhase = savedPhase;
+            if (ok) DeserOk++;
+            else DeserFail++;
+        }
+        catch (Exception e)
+        {
+            DeserFail++;
+            if (DeserFail <= 3) MelonLogger.Warning("[DESER] 反序列化异常: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
+    /// <summary>该字段的元素类型是否含指定字段（用于"这条追加项到底该不该有 ActionName"的判空口径）。</summary>
+    public static bool ElementTypeHasField(object host, string field, string probe)
+    {
+        try
+        {
+            var gen = WarpperClassGen.MainGen.GetOrGen(host.GetType());
+            if (!gen.TryGetValue(field, out var tuple) || tuple.fldType == null) return false;
+            var ft = tuple.fldType;
+            Type elem = null;
+            if (IsIl2CppArrayType(ft))
+            {
+                elem = ft.IsGenericType ? ft.GetGenericArguments()[0] : ft.GetElementType();
+            }
+            else if (ft.IsGenericType)
+            {
+                elem = ft.GetGenericArguments()[0];
+            }
+
+            if (elem == null) return false;
+            var egen = WarpperClassGen.MainGen.GetOrGen(elem);
+            return egen != null && egen.ContainsKey(probe);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    /// <summary>ASCII 类名（`il2cpp_class_get_name` + ANSI 解码）—— 避免日志里出现 `?x` 这类乱码。</summary>
+    public static string AsciiClassName(IntPtr objPtr)
+    {
+        try
+        {
+            if (objPtr == IntPtr.Zero) return "?";
+            var cls = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_get_class(objPtr);
+            if (cls == IntPtr.Zero) return "?";
+            var namePtr = Il2CppInterop.Runtime.IL2CPP.il2cpp_class_get_name(cls);
+            return namePtr == IntPtr.Zero ? "?" : (Marshal.PtrToStringAnsi(namePtr) ?? "?");
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+    /// <summary>读 `ActionName.DefaultText`（内联结构里的字符串），用于"写进去没有"的客观判据。</summary>
+    public static string ReadName(object element)
+    {
+        try
+        {
+            var an = Member(element, "ActionName");
+            if (an == null) return "<无ActionName字段>";
+            var txt = Member(an, "DefaultText")?.ToString();
+            if (!string.IsNullOrEmpty(txt)) return txt;
+            var lk = Member(an, "LocalizationKey")?.ToString();
+            return string.IsNullOrEmpty(lk) ? "" : lk;
+        }
+        catch (Exception e)
+        {
+            return "<读取异常:" + e.GetType().Name + ">";
+        }
+    }
+    // ═══════════ JsonUtility：直接走已确认可用的 ICall（安全，无裸内存操作） ═══════════
+    public static int FromJsonIcallOk, FromJsonIcallFail;
+
+    /// <summary>
+    /// `UnityEngine.JsonUtility::FromJsonInternal(json, objectToOverwrite, type)`（ICALL-AVAILABLE 确认 impl=0x17A3C0）。
+    /// 为什么绕开托管版 `FromJsonOverwrite`：托管版的第三个参数（目标类型）由**包装类型**推断，
+    /// 一旦被 `Cast&lt;Il2CppSystem.Object&gt;()` 包过就变成 `System.Object` → 一个字段都写不进（真机实测）。
+    /// 这里显式传 `il2cpp_type_get_object(il2cpp_class_get_type(真实类))` —— 纯 ICall，无内存直写。
+    /// </summary>
+    public static bool FromJsonViaIcall(string json, Il2CppObjectBase obj)
+    {
+        try
+        {
+            if (obj == null || string.IsNullOrEmpty(json)) return false;
+            var fn = RawTexture.ResolveIcall("UnityEngine.JsonUtility::FromJsonInternal");
+            if (fn == IntPtr.Zero)
+            {
+                FromJsonIcallFail++;
+                return false;
+            }
+
+            var ptr = obj.Pointer;
+            var cls = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_get_class(ptr);
+            if (cls == IntPtr.Zero) { FromJsonIcallFail++; return false; }
+            var typeObj = Il2CppInterop.Runtime.IL2CPP.il2cpp_type_get_object(
+                Il2CppInterop.Runtime.IL2CPP.il2cpp_class_get_type(cls));
+            var str = Il2CppInterop.Runtime.IL2CPP.il2cpp_string_new(json);
+            if (typeObj == IntPtr.Zero || str == IntPtr.Zero) { FromJsonIcallFail++; return false; }
+
+            unsafe
+            {
+                var del = (delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, void>)fn;
+                del(str, ptr, typeObj);
+            }
+
+            FromJsonIcallOk++;
+            return true;
+        }
+        catch (Exception e)
+        {
+            FromJsonIcallFail++;
+            if (FromJsonIcallFail <= 3)
+                MelonLogger.Warning("[ARR] FromJsonInternal 调用失败: " + e.GetType().Name + " " + e.Message);
+            return false;
+        }
+    }
+    // ═══════════ 值类型字段：**只走托管属性 setter**（安全通道） ═══════════
+    //  ⚠ 2026-10-03 真机教训：按"基址+偏移"直写非托管内存会在启动期 SIGSEGV（写坏内存），
+    //    整条直写路径已撤销，永不恢复。这里只做托管属性赋值 —— 由运行时保证类型/GC 安全。
+    public static int SafeSetterOk, SafeSetterFail;
+
+    /// <summary>
+    /// 值类型字段的安全写入：只用 **生成的托管属性 setter**。
+    /// · 基础类型/枚举/字符串 → `Convert.ChangeType` 后 `prop.SetValue`；
+    /// · 内联结构（如 `LocalizedString`）→ 取结构的托管代理，对**子字段**继续用属性 setter，并**读回验证**是否生效
+    ///  （不生效只记日志，不做任何裸内存写入）。
+    /// </summary>
+    public static bool TrySetManagedField(object host, string fld, KVProvider v)
+    {
+        try
+        {
+            if (host == null) return false;
+            var prop = host.GetType().GetProperty(fld);
+            if (prop == null || !prop.CanWrite) return false;   // 没有 setter = 不适用，不计数（避免 12 万条假失败）
+            var pt = prop.PropertyType;
+
+            if (v.IsObject)
+            {
+                // 内联结构：拿到托管代理后对子字段赋值，再读回验证
+                var sub = prop.GetValue(host);
+                if (sub == null) return false;
+                var any = false;
+                foreach (var k in v.Keys)
+                {
+                    var sp = sub.GetType().GetProperty(k);
+                    if (sp == null || !sp.CanWrite) continue;
+                    if (AssignScalar(sp, sub, v[k])) any = true;
+                }
+
+                if (!any) return false;
+                var readBack = prop.GetValue(host);
+                var ok = readBack != null && DescribeValue(readBack) != DescribeValue(sub);
+                if (SetterVerifyLogged < 10)
+                {
+                    SetterVerifyLogged++;
+                    MelonLogger.Msg("[INL] 内联结构经属性写入: " + host.GetType().Name + "." + fld
+                                    + " 子字段写入=" + any + " 读回生效=" + ok + " 读回值=" + DescribeValue(readBack));
+                }
+
+                if (ok) SafeSetterOk++;
+                else SafeSetterFail++;
+                return ok;
+            }
+
+            if (v.IsArray || (!v.IsObject && !v.IsString && !v.IsInt && !v.IsBoolean)) return false;   // 不适用，不计数
+
+            if (AssignScalar(prop, host, v))
+            {
+                SafeSetterOk++;
+                if (SetterVerifyLogged < 10)
+                {
+                    SetterVerifyLogged++;
+                    MelonLogger.Msg("[INL] 值类型属性已写: " + host.GetType().Name + "." + fld
+                                    + " = " + v.ToString() + " 读回=" + prop.GetValue(host));
+                }
+
+                return true;
+            }
+        }
+        catch (Exception e)
+        {
+            if (SafeSetterSamples.Count < 10) SafeSetterSamples.Add(host?.GetType().Name + "." + fld + " : " + e.Message);
+        }
+
+        SafeSetterFail++;
+        return false;
+    }
+
+    private static bool AssignScalar(System.Reflection.PropertyInfo p, object target, KVProvider v)
+    {
+        try
+        {
+            var pt = p.PropertyType;
+            object val;
+            if (pt == typeof(string)) val = v.IsString ? v.String : v.ToString().Trim('"');
+            else if (pt == typeof(bool)) val = v.IsBoolean ? v.String.Equals("true", StringComparison.OrdinalIgnoreCase) : bool.Parse(v.String);
+            else if (pt == typeof(float)) val = Convert.ToSingle(v.IsInt ? (object)v.Int : double.Parse(v.String, System.Globalization.CultureInfo.InvariantCulture));
+            else if (pt == typeof(double)) val = v.IsInt ? (double)v.Int : double.Parse(v.String, System.Globalization.CultureInfo.InvariantCulture);
+            else if (pt == typeof(long)) val = v.IsInt ? (long)v.Int : long.Parse(v.String, System.Globalization.CultureInfo.InvariantCulture);
+            else if (pt == typeof(int) || pt.IsEnum) val = v.IsInt ? v.Int : int.Parse(v.String, System.Globalization.CultureInfo.InvariantCulture);
+            else return false;
+            p.SetValue(target, val);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static int SetterVerifyLogged;
+    public static readonly List<string> SafeSetterSamples = new();
+    // ═══════════ GSM 逐条「内容级」判据（Lead 指定：证据不许含糊） ═══════════
+
+    /// <summary>从一个 GSM JSON 里取出被改字段名与 WarpType（键形如 `XxxWarpData` + `XxxWarpType`）。</summary>
+    public static List<(string Field, int WarpType, int ElemCount, string ElemKind)> GsmFieldsOf(KVProvider json)
+    {
+        var list = new List<(string, int, int, string)>();
+        try
+        {
+            foreach (var k in json.Keys)
+            {
+                if (!k.EndsWith("WarpType")) continue;
+                var fld = k.Substring(0, k.Length - 8);
+                var wt = 0;
+                try { if (json[k].IsInt) wt = json[k].Int; } catch { }
+                var n = 0;
+                var kind = "?";
+                if (json.ContainsKey(fld + "WarpData"))
+                {
+                    var d = json[fld + "WarpData"];
+                    if (d.IsArray)
+                    {
+                        n = d.Count;
+                        if (n > 0) kind = d[0].IsObject ? "obj" : (d[0].IsString ? "str" : "?");
+                    }
+                    else if (d.IsString) { n = 1; kind = "str"; }
+                }
+
+                list.Add((fld, wt, n, kind));
+            }
+        }
+        catch
+        {
+        }
+
+        return list;
+    }
+
+    /// <summary>字段内容快照：容器字段 → "N 项: 名称1|名称2…"；标量/引用 → ToString()/名字。</summary>
+    public static Dictionary<string, string> FieldSnapshot(object obj, List<string> fields)
+    {
+        var d = new Dictionary<string, string>();
+        foreach (var f in fields)
+        {
+            try
+            {
+                if (IsContainerField(obj, f))
+                {
+                    d[f] = ContainerDetails(obj, f, 3);
+                }
+                else
+                {
+                    var v = WarpperClassGen.MainGenTools.CommonGet(obj, f);
+                    d[f] = DescribeValue(v);
+                }
+            }
+            catch (Exception e)
+            {
+                d[f] = "<读取失败:" + e.GetType().Name + ">";
+            }
+        }
+
+        return d;
+    }
+
+    /// <summary>
+    /// 元素级明细（问题 2 判定用）：原生指针 + 关键字段值。
+    /// 若同一元素改前/改后这些值完全一致 → 只是打印问题；有任何差异 → 真损坏。
+    /// </summary>
+    /// <summary>该字段是不是"数组/List"（决定用条目明细还是标量值来描述）。</summary>
+    public static bool IsContainerField(object obj, string fld)
+    {
+        try
+        {
+            var gen = WarpperClassGen.MainGen.GetOrGen(obj.GetType());
+            if (!gen.TryGetValue(fld, out var tuple)) return false;
+            var ft = tuple.fldType;
+            if (ft == null) return false;
+            if (IsIl2CppArrayType(ft)) return true;
+            return ft.IsGenericType &&
+                   ft.GetGenericTypeDefinition() == typeof(Il2CppSystem.Collections.Generic.List<>);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    public static string ElementDetails(object container, int idx)
+    {
+        try
+        {
+            var e = Retype(GetElem(container, idx));
+            if (e == null) return "[" + idx + "]=<null>";
+            var ptr = PtrOf(e).ToInt64().ToString("X");
+            var an = Member(e, "ActionName");
+            var txt = an == null ? "-" : (Member(an, "DefaultText")?.ToString() ?? "-");
+            var cost = Member(e, "DaytimeCost")?.ToString() ?? "-";
+            var prod = Member(e, "ProducedCards");
+            var reqd = Member(e, "RequiredCardsOnBoard");
+            var reqT = Member(e, "RequiredTagsOnBoard");
+            return "[" + idx + "] ptr=0x" + ptr + " ActionName=\"" + txt + "\" DaytimeCost=" + cost
+                   + " ProducedCards=" + (int)ElemCount(prod) + " RequiredCardsOnBoard=" + (int)ElemCount(reqd)
+                   + " RequiredTagsOnBoard=" + (int)ElemCount(reqT);
+        }
+        catch (Exception e2)
+        {
+            return "[" + idx + "]=<明细失败:" + e2.GetType().Name + ">";
+        }
+    }
+
+    /// <summary>一个容器字段的"逐元素明细"（最多前 N 个），用于改前/改后对比。</summary>
+    public static string ContainerDetails(object obj, string field, int max = 3)
+    {
+        try
+        {
+            var v = WarpperClassGen.MainGenTools.CommonGet(obj, field);
+            var n = (int)ElemCount(v);
+            if (n <= 0) return "(" + n + " 项)";
+            var parts = new List<string>();
+            for (var i = 0; i < n && i < max; i++) parts.Add(ElementDetails(v, i));
+            return "(" + n + " 项) " + string.Join(" ; ", parts);
+        }
+        catch (Exception e)
+        {
+            return "<明细失败:" + e.GetType().Name + ">";
+        }
+    }
+    /// <summary>容器 → 条目数 + 每个元素的"人话名字"（ActionName.DefaultText / CardName.DefaultText / name）。</summary>
+    public static string DescribeValue(object v)
+    {
+        if (v == null) return "<null>";
+        try
+        {
+            var n = (int)ElemCount(v);
+            if (n > 0)
+            {
+                var parts = new List<string>();
+                for (var i = 0; i < n && i < 8; i++)
+                    parts.Add(ElemName(GetElem(v, i)));
+                return n + " 项[" + string.Join(" | ", parts) + (n > 8 ? " | …" : "") + "]";
+            }
+
+            if (n == 0 && (IsIl2CppArrayType(v.GetType()) || v.GetType().Name.Contains("List")))
+                return "0 项[]";
+
+            var s = v.ToString();
+            if (!string.IsNullOrEmpty(s) && s != v.GetType().FullName) return s;
+            var nm = NameOf(v);
+            if (!string.IsNullOrEmpty(nm)) return nm;
+            return "0x" + PtrOf(v).ToInt64().ToString("X");
+        }
+        catch
+        {
+            return "<描述失败>";
+        }
+    }
+
+    private static string ElemName(object e)
+    {
+        if (e == null) return "<null>";
+        try
+        {
+            // 打印副作用修复：数组被重建后，元素代理可能退化成基类/Il2CppSystem.Object，
+            // 于是 ActionName 等属性取不到、回退成类型名（真机实测 6 项[Ignore it|…] → 6 项[DismantleCardAction×6]）。
+            e = Retype(e);
+            var an = Member(e, "ActionName");                       // CardAction / DismantleCardAction
+            if (an != null)
+            {
+                var s = Member(an, "DefaultText")?.ToString();
+                if (!string.IsNullOrEmpty(s)) return s;
+                var lk = Member(an, "LocalizationKey")?.ToString();
+                if (!string.IsNullOrEmpty(lk)) return lk;
+            }
+
+            var cn = Member(e, "CardName");                         // CardData
+            if (cn != null)
+            {
+                var s = Member(cn, "DefaultText")?.ToString();
+                if (!string.IsNullOrEmpty(s)) return s;
+            }
+
+            var nm = Member(e, "name")?.ToString();
+            if (!string.IsNullOrEmpty(nm)) return nm;
+            var id = Member(e, "UniqueID")?.ToString();
+            if (!string.IsNullOrEmpty(id)) return id.Substring(0, Math.Min(8, id.Length));
+            return Cls(PtrOf(e)) ?? "?";
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+
+    /// <summary>
+    /// 逐条 GSM 判据（不设上限，63 条全打）：
+    /// `[GSM] 目标[7/63] CardData/LemonGrass guid=ab12cd34 字段=DismantleActions WarpType=4 字段存在=True`
+    /// `[GSM]   DismantleActions: 2 项[…] → 3 项[…] ✓`
+    /// 未命中时追加一行 warp 对详情（键名/类型/元素数/元素类型），用于切开"JSON 没解析出键"与"没落到字段"。
+    /// </summary>
+    public static void LogGsmEntry(int idx, int total, object obj, string guid, KVProvider json,
+        Dictionary<string, string> before)
+    {
+        try
+        {
+            var cls = Cls(obj is Il2CppObjectBase ib ? ib.Pointer : IntPtr.Zero);
+            var name = NameOf(obj);
+            var g8 = string.IsNullOrEmpty(guid) ? "?" : guid.Substring(0, Math.Min(8, guid.Length));
+            var gen = WarpperClassGen.MainGen.GetOrGen(obj.GetType());
+
+            var fields = GsmFieldsOf(json);
+            var changedAny = false;
+
+            foreach (var (fld, wt, cnt, kind) in fields)
+            {
+                var exists = gen.ContainsKey(fld);
+                var after = FieldSnapshot(obj, new List<string> { fld })[fld];
+                before.TryGetValue(fld, out var b);
+                b ??= "<未采样>";
+                var changed = b != after;
+                if (changed) changedAny = true;
+                MelonLogger.Msg("[GSM] 目标[" + idx + "/" + total + "] " + cls + "/" + name + " " + g8
+                                + " 字段=" + fld + " WarpType=" + wt + "(" + WarpTypeName(wt) + ")"
+                                + " 字段存在=" + exists + " JSON元素=" + cnt + "(" + kind + ")");
+                MelonLogger.Msg("[GSM]   " + fld + ": " + b + " → " + after + (changed ? " ✓" : "  ⚠未变化"));
+                // 问题2 判定：逐元素"原生指针 + 关键字段值"改前/改后对比
+                //  （值完全一致 = 只是打印问题；有差异 = 真损坏，必须只追加不重建）
+                if (IsContainerField(obj, fld))
+                {
+                    var beforeObj = WarpperClassGen.MainGenTools.CommonGet(obj, fld);
+                    MelonLogger.Msg("[GSM]     " + fld + " 明细改后: " + ContainerDetails(obj, fld, 3));
+                    var bl = b;
+                    MelonLogger.Msg("[GSM]     " + fld + " 明细改前: " + bl);
+                }
+            }
+
+            // 记录"新增段"供后置复读（条数增长 = 尾部新增）
+            try
+            {
+                foreach (var (fld2, _, _, _) in fields)
+                {
+                    var bCnt = CountOfBefore(before, fld2);
+                    var aCnt = (int)ElemCount(WarpperClassGen.MainGenTools.CommonGet(obj, fld2));
+                    if (aCnt > bCnt) GsmAppended.Add((obj, fld2, bCnt));
+                }
+            }
+            catch
+            {
+            }
+
+            if (changedAny)
+            {
+                GsmApplied++;
+                if (!string.IsNullOrEmpty(guid)) IntentionalGuids.Add(guid);
+                try { if (obj is Il2CppObjectBase ib2) IntentionalTargets.Add(ib2.Pointer); } catch { }
+                IntentionalLog.Add("[GSM] " + cls + "/" + name + "(" + g8 + ") 已改 " + fields.Count + " 个字段");
+            }
+            else
+            {
+                GsmNoChange++;
+                // 未变化 → 把消费端实际收到的 warp 对原样打出来（Lead 指定的一刀切证据）
+                foreach (var (fld, wt, cnt, kind) in fields)
+                {
+                    var has = json.ContainsKey(fld + "WarpData");
+                    var dataKind = "缺失";
+                    if (has)
+                    {
+                        var d = json[fld + "WarpData"];
+                        dataKind = d.IsArray ? ("数组(" + d.Count + " 元素, 首元素="
+                                                + (d.Count > 0 ? (d[0].IsObject ? "对象" : d[0].IsString ? "字符串" : "其它") : "空")
+                                                + ")")
+                            : d.IsString ? "字符串" : d.IsObject ? "对象" : "其它";
+                    }
+
+                    MelonLogger.Msg("[GSM]   ⚠ warp对: " + fld + "WarpData 存在=" + has + " 类型=" + dataKind
+                                    + " ; " + fld + "WarpType=" + wt + " 字段在gen表=" + gen.ContainsKey(fld)
+                                    + " 对象类型=" + obj.GetType().Name);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            GsmFailed++;
+            MelonLogger.Warning("[GSM] 判据打印失败(" + guid + "): " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
+    /// <summary>从"改前明细"字符串里解析出条目数（形如 "(6 项) …"）。</summary>
+    private static int CountOfBefore(Dictionary<string, string> before, string field)
+    {
+        try
+        {
+            if (!before.TryGetValue(field, out var s) || string.IsNullOrEmpty(s)) return -1;
+            var i = s.IndexOf(" 项", StringComparison.Ordinal);
+            if (i <= 0) return -1;
+            var j = s.LastIndexOf('(', i);
+            if (j < 0) return -1;
+            return int.Parse(s.Substring(j + 1, i - j - 1));
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
+    private static string WarpTypeName(int wt)
+    {
+        return wt switch
+        {
+            0 => "NONE",
+            1 => "COPY",
+            2 => "CUSTOM",
+            3 => "REFERENCE",
+            4 => "ADD",
+            5 => "MODIFY",
+            6 => "ADD_REFERENCE",
+            _ => "?"
+        };
+    }
+    // ─────────────────── GSM（改造游戏自带卡牌）判据与"有意修改"登记 ───────────────────
+    /// <summary>本轮**有意**修改过的游戏对象（GSM 目标）—— INVARIANT 采样要排除它们，并单独列清单。</summary>
+    public static readonly HashSet<IntPtr> IntentionalTargets = new();
+    /// <summary>同上，按 GUID 记（INVARIANT 快照是按 `类|GUID` 存的，排除时用得上）。</summary>
+    public static readonly HashSet<string> IntentionalGuids = new();
+    public static readonly List<string> IntentionalLog = new();
+    public static int GsmApplied, GsmNoChange, GsmFailed;
+
+    /// <summary>取对象上所有「数组/List」字段的条目数（GSM 改造前后对比用）。</summary>
+    public static Dictionary<string, int> ContainerCountsOf(object obj)
+    {
+        var d = new Dictionary<string, int>();
+        if (obj == null) return d;
+        try
+        {
+            foreach (var kv in WarpperClassGen.MainGen.GetOrGen(obj.GetType()))
+            {
+                var ft = kv.Value.fldType;
+                if (ft == null) continue;
+                var isList = false;
+                try { isList = ft.IsGenericType && ft.GetGenericTypeDefinition() == typeof(Il2CppSystem.Collections.Generic.List<>); }
+                catch { }
+                if (!isList && !IsIl2CppArrayType(ft)) continue;
+                try
+                {
+                    var v = WarpperClassGen.MainGenTools.CommonGet(obj, kv.Key);
+                    d[kv.Key] = (int)ElemCount(v);
+                }
+                catch
+                {
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return d;
+    }
+
+    /// <summary>
+    /// `[GSM] 名字(guid): 字段 X→Y ✓`：逐条打印**改前→改后**数字（Lead 指定的客观判据），
+    /// 并把该对象登记为"有意修改"（供 INVARIANT 排除 + 清单输出）。
+    /// </summary>
+    public static void LogGsmChange(object obj, string guid, Dictionary<string, int> before)
+    {
+        try
+        {
+            var after = ContainerCountsOf(obj);
+            var changes = new List<string>();
+            foreach (var kv in after)
+            {
+                before.TryGetValue(kv.Key, out var b);
+                if (b != kv.Value) changes.Add(kv.Key + " " + b + "→" + kv.Value);
+            }
+
+            foreach (var kv in before)
+                if (!after.ContainsKey(kv.Key))
+                    changes.Add(kv.Key + " " + kv.Value + "→(字段消失)");
+
+            if (!string.IsNullOrEmpty(guid)) IntentionalGuids.Add(guid);
+            var name = NameOf(obj);
+            var cls = Cls(obj is Il2CppObjectBase ib ? ib.Pointer : IntPtr.Zero);
+            var g8 = string.IsNullOrEmpty(guid) ? "?" : guid.Substring(0, Math.Min(8, guid.Length));
+
+            if (changes.Count > 0)
+            {
+                GsmApplied++;
+                var line = "[GSM] " + cls + " " + name + "(" + g8 + "): " + string.Join(" / ", changes) + " ✓";
+                MelonLogger.Msg(line);
+                IntentionalLog.Add(line);
+                try { if (obj is Il2CppObjectBase ib2) IntentionalTargets.Add(ib2.Pointer); } catch { }
+            }
+            else
+            {
+                GsmNoChange++;
+                MelonLogger.Msg("[GSM] " + cls + " " + name + "(" + g8 + "): 无字段条目变化"
+                                + "（JSON 键=" + (before.Count) + " 个容器字段已比对；可能是标量/引用类字段改动）");
+            }
+        }
+        catch (Exception e)
+        {
+            GsmFailed++;
+            MelonLogger.Warning("[GSM] 判据打印失败(" + guid + "): " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
+    /// <summary>
+    /// `[GSM] 判据覆盖`：47 个目标**逐条**都做了"改前/改后"比对（这是真正的覆盖），
+    /// 而不是靠在 76 个对象的小样本里碰运气（真机实测采样内命中=0，因为 20 个/类的采样撞不上那 47 张卡）。
+    /// </summary>
+    public static void DumpGsmCoverage()
+    {
+        try
+        {
+            var total = GsmApplied + GsmNoChange;
+            MelonLogger.Msg("[GSM] 判据覆盖: 逐条前后比对=" + total + " 条（有意变化=" + GsmApplied
+                            + " 无变化=" + GsmNoChange + " 失败=" + GsmFailed + "）"
+                            + "；被改对象=" + IntentionalGuids.Count + " 个"
+                            + "；[INVARIANT] 小样本(每类≤20/共76)内命中=" + GsmSampleHit
+                            + "（样本撞不上属正常，覆盖以本行为准）");
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>GSM 追加出来的元素（宿主对象 / 字段 / 新增段起始下标），供"全部 warp 完成后"的后置复读。</summary>
+    public static readonly List<(object Host, string Field, int FirstNew)> GsmAppended = new();
+
+    /// <summary>
+    /// `[GSM] 后置复读 <宿主>.<字段>[i]: ActionName="…" DaytimeCost=… ProducedCards=…`
+    /// —— 在**全部 warp 完成之后**再读一次追加元素，用来排除"打印时机"造成的假空字段。
+    /// </summary>
+    public static void DumpGsmAppendedReadback()
+    {
+        try
+        {
+            var empty = 0;
+            var withName = 0;
+            var withoutName = 0;
+            foreach (var (host, field, firstNew) in GsmAppended)
+            {
+                var hn = NameOf(host) ?? "?";
+                var details = ContainerDetails(host, field, 6);
+                MelonLogger.Msg("[GSM] 后置复读 " + hn + "." + field + "（新增自下标 " + firstNew + "）: " + details);
+
+                // ★ [2026-10-03 第 4 轮] 只统计**确实含 ActionName 字段**的元素：大部分追加项是掉落/概率类
+                //   （`CardDropChanceModifiers`/`ProducedCards`），根本没有 ActionName → 原来被算成"空"= 假警报。
+                if (ElementTypeHasField(host, field, "ActionName"))
+                {
+                    withName++;
+                    if (details.Contains("ActionName=\"-\"")) empty++;
+                }
+                else
+                {
+                    withoutName++;
+                }
+            }
+
+            MelonLogger.Msg("[GSM] 后置复读汇总: 含 ActionName 的字段=" + withName + " 个（其中仍为空=" + empty + "）"
+                            + "；无 ActionName 字段=" + withoutName + " 个（掉落/概率类，不参与判空）"
+                            + (withName > 0 && empty == 0
+                                ? " ✓ 追加元素字段已写入"
+                                : withName == 0
+                                    ? "（本轮没有含 ActionName 的追加项）"
+                                    : " ⚠ 仍有空字段（见上）"));
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[GSM] 后置复读失败: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+    /// <summary>[INVARIANT] 小样本里刚好撞上 GSM 目标的个数（由 CompareGameContainers 统计）。</summary>
+    public static int GsmSampleHit;
+    /// <summary>`[GSM] 有意修改的游戏卡片清单` + 计数（供 Lead 区分"有意改动"与"意外污染"）。</summary>
+    public static void DumpIntentionalSummary()
+    {
+        try
+        {
+            MelonLogger.Msg("[GSM] 有意修改汇总: 成功=" + GsmApplied + " 无字段变化=" + GsmNoChange
+                            + " 失败=" + GsmFailed + " 涉及对象=" + IntentionalTargets.Count);
+            for (var i = 0; i < IntentionalLog.Count && i < 70; i++)
+                MelonLogger.Msg("[GSM]   有意修改[" + (i + 1) + "] " + IntentionalLog[i].Replace("[GSM] ", ""));
+        }
+        catch
+        {
+        }
+    }
+
     /// <summary>把注册表对象安全转成具体代理类型（GetType() 常常只返回 UniqueIDScriptable）。</summary>
     public static T CastOrNull<T>(object o) where T : Il2CppObjectBase
     {

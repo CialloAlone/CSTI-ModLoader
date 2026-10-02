@@ -664,26 +664,51 @@ public static class LoadArchMod
                 }
                 else if (listStr[0] == "GameSourceModify")
                 {
-                    // [回归修复 2026-10-02] 这里**故意**还原成「整条路径当键」（= inert）：
-                    // 用 CleanName 之后这些条目会真的解析到**游戏自带对象**，mod 数据被写进原版事件/卡牌/天气
-                    // 相关对象 —— 用户实测「开局事件选药物没给东西、改天气无效」，判定为回归。
-                    // 在能把 mod 写入与游戏对象彻底隔离之前，这条链路保持与"正常版本"一致的行为。
-                    // 但仍用 CleanName 做一次**只读**判断，记录它本来会改到哪些对象，便于后续决策。
-                    var rawKey = Path.GetFileNameWithoutExtension(listStr.Last());
-                    if (AllGUIDDict.TryGetValue(CleanName(listStr.Last()), out var wouldTarget))
+                    // [2026-10-03 修复] GSM = 「改造**游戏自带**卡牌」的路径 —— Windy 的"精灵能力"就靠它
+                    // （采摘柠檬草/芦荟/卡瓦/大叶仙茅/蜘蛛兰/椰子树…，纤维缠细线、棕榈叶编织、泥堆→粘土…）。
+                    // PC 侧语义（CSTI-ModLoader/ModLoader.cs:1243）：
+                    //   var Guid = Path.GetFileNameWithoutExtension(file);   // 文件名 = 目标卡 GUID
+                    //   AllGUIDDict.TryGetValue(Guid, out var obj) ? Pack(obj,…) : Pack(null, Guid, …)
+                    // PC 上 AllGUIDDict 含**全部**卡牌（游戏自带 + mod）→ 能直接命中；
+                    // 我们的移植版 AllGUIDDict **只登记 mod 对象**（游戏自带对象在
+                    // UniqueIDScriptable.AllUniqueObjects，当初又用 typeof(UniqueIDScriptable) 注册，
+                    // 被 RegObj 的子类判定挡掉）→ 63 条 GSM 全部 inert → 精灵能力全失效。
+                    // 修法：先查 AllGUIDDict，查不到再查**游戏注册表** —— 与 PC 语义对齐。
+                    var guid = CleanName(listStr.Last());
+                    ScriptableObject gsmTarget = null;
+                    string gsmFrom;
+                    if (AllGUIDDict.TryGetValue(guid, out var gsmMod))
+                    {
+                        gsmTarget = gsmMod;
+                        gsmFrom = "mod字典";
+                    }
+                    else
+                    {
+                        gsmFrom = "未解析";
+                        var reg = UniqueIDScriptable.AllUniqueObjects;
+                        if (reg != null && reg.TryGetValue(guid, out var gsmGame) && gsmGame != null)
+                        {
+                            gsmTarget = gsmGame;
+                            gsmFrom = "游戏注册表";
+                        }
+                    }
+
+                    if (gsmTarget != null)
                     {
                         GameSourceModifyResolved++;
-                        if (GameSourceModifyResolved <= 8)
-                            MelonLogger.Warning("[GSM] 本会被修改的游戏对象: " + Diag.Cls(wouldTarget) + " / "
-                                                + Diag.NameOf(wouldTarget) + " / GUID=" + CleanName(listStr.Last()));
+                        if (GameSourceModifyResolved <= 12)
+                            MelonLogger.Msg("[GSM] 目标已解析(" + gsmFrom + "): " + Diag.Cls(gsmTarget) + " / "
+                                            + Diag.NameOf(gsmTarget) + " / GUID=" + guid);
                     }
                     else
                     {
                         GameSourceModifyInert++;
+                        if (GameSourceModifyInert <= 8)
+                            MelonLogger.Warning("[GSM] 目标未解析（mod 字典与游戏注册表都没有）: GUID=" + guid);
                     }
 
                     WaitForWarpperEditorGameSourceGUIDList.Add(
-                        new ScriptableObjectPack(null, rawKey, "", modName, mapperObject));
+                        new ScriptableObjectPack(gsmTarget, guid, "", modName, mapperObject));
                 }
                 else
                 {

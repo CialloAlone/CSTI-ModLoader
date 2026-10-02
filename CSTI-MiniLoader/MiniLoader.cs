@@ -144,18 +144,39 @@ public class MiniLoader : MelonMod
                 "禁用 ICallFix 的 shim 创建路径（只用自带兜底，便于两条路径对照验收）");
             SkipShimCreation = skipShimEntry.Value;
 
-            // 控制台卡表维护（mod 卡可见性），默认 true
+            // cfg 路径（MelonPreferences 在 UserData 下）+ 旧键兼容
             var cheatEntry = cat.CreateEntry("MaintainCheatLists", true,
                 "在泵里把 mod 卡牌补进 CheatsManager.AllCards / GameManager.AllCards（控制台能搜到）");
             MaintainCheatLists = cheatEntry.Value;
+
+            var gsmEntry = cat.CreateEntry("GSM_Apply", true,
+                "是否应用 GameSourceModify（改造游戏原有卡牌，如精灵采摘/编织/缠线）");
+            GsmApply = gsmEntry.Value;
+
+            var gsmInline = cat.CreateEntry("GSM_InlineWrite", false,
+                "值类型字段是否走托管属性 setter 安全通道（默认关；直写内存已撤销，会崩）");
+            GsmInlineWrite = gsmInline.Value;
             var fillEntry = cat.CreateEntry("CheatListsTriggerFill", true,
                 "mod 卡不在控制台列表时调用游戏 FillCards() 重填一次");
             CheatListsTriggerFill = fillEntry.Value;
 
+            try
+            {
+                PrefPath = System.IO.Path.Combine(
+                    MelonLoader.Utils.MelonEnvironment.UserDataDirectory, "MelonPreferences.cfg");
+            }
+            catch
+            {
+                PrefPath = null;
+            }
+
+            if (ApplyLegacyPrefs())
+                MelonLogger.Msg("[PREF] 检测到旧键（GSM.Apply / GSM.InlineWrite），已按文件值覆盖一次");
+
             MelonLogger.Msg("[DIAGLVL] 诊断级别 = " + Diag + "（配置 CSTI_MiniLoader/DiagLevel）"
                             + " | AddToGameDataBase=" + !SkipGameDataBaseAdd
                             + " | UseOwnCreationFallback=" + UseOwnCreationFallback
-                            + " | SkipShimCreation=" + SkipShimCreation + " | MaintainCheatLists=" + MaintainCheatLists);
+                            + " | SkipShimCreation=" + SkipShimCreation + " | MaintainCheatLists=" + MaintainCheatLists + " | GSM.Apply=" + GsmApply + " | GSM.InlineWrite=" + GsmInlineWrite);
         }
         catch (Exception e)
         {
@@ -202,6 +223,15 @@ public class MiniLoader : MelonMod
     /// </summary>
     public static bool MaintainCheatLists = true;
 
+    /// <summary>总开关：是否应用 GameSourceModify（改造游戏原有卡牌）。`CSTI_MiniLoader/GSM.Apply`（默认 true）。
+    /// 关掉即完全不碰游戏对象（出问题时的一键回退）。</summary>
+    public static bool GsmApply = true;
+
+    /// <summary>值类型字段的**安全通道**：是否用托管属性 setter 去填（默认 **false**）。
+    /// `CSTI_MiniLoader/GSM.InlineWrite`。真机教训：直写非托管内存会 SIGSEGV，已永久撤销；
+    /// 这里只允许 `prop.SetValue`，失败就跳过。</summary>
+    public static bool GsmInlineWrite;
+
     /// <summary>
     /// mod 卡不在控制台列表里时，是否调用游戏自己的 `CheatsManager.FillCards()` 重填一次（最多 3 次）。
     /// MelonPreferences：`CSTI_MiniLoader/CheatListsTriggerFill`（默认 true）。
@@ -211,6 +241,49 @@ public class MiniLoader : MelonMod
     /// <summary>是否把 LoadAndInit 延后到注册表就绪之后（推荐 true）。</summary>
     public static bool DeferredInit;
 
+    /// <summary>MelonPreferences.cfg 的绝对路径（供"文件里到底有没有这个键"判据）。</summary>
+    public static string PrefPath;
+
+    /// <summary>文件里是否有该键（true=读的是文件值；false=用的是代码默认值）。</summary>
+    public static string PrefFileHas(string key)
+    {
+        var raw = PrefFileRaw(key);
+        return raw == null ? "无(默认)" : "有=" + raw;
+    }
+
+    /// <summary>从 MelonPreferences.cfg 里按 `key = value` 取原始值（支持带引号的键名，如旧的 "GSM.InlineWrite"）。</summary>
+    public static string PrefFileRaw(string key)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(PrefPath) || !System.IO.File.Exists(PrefPath)) return null;
+            foreach (var line in System.IO.File.ReadAllLines(PrefPath))
+            {
+                var s = line.Trim();
+                if (s.Length == 0 || s[0] == '[' || s[0] == '#') continue;
+                var eq = s.IndexOf('=');
+                if (eq <= 0) continue;
+                var k = s.Substring(0, eq).Trim().Trim('"');
+                if (k == key) return s.Substring(eq + 1).Trim();
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
+    /// <summary>旧键（带点号）兼容：若文件里有 `GSM.Apply`/`GSM.InlineWrite` 就按它覆盖一次。</summary>
+    private static bool ApplyLegacyPrefs()
+    {
+        var changed = false;
+        var a = PrefFileRaw("GSM.Apply");
+        if (a != null && bool.TryParse(a, out var av)) { GsmApply = av; changed = true; }
+        var i = PrefFileRaw("GSM.InlineWrite");
+        if (i != null && bool.TryParse(i, out var iv)) { GsmInlineWrite = iv; changed = true; }
+        return changed;
+    }
     private static bool _initDone;
 
     /// <summary>由 HookFree 在注册表就绪后调用一次。</summary>

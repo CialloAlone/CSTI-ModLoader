@@ -387,6 +387,10 @@ public static class LoadResources
     }
 
 
+    /// <summary>GSM 逐条判据的计数（本轮已处理条数 / 预期总条数，来自离线解包：63 条）。</summary>
+    private static int GsmSeen;
+    private const int GsmTotalExpected = 63;
+
     public static void WarpperAllEditorGameSrouces()
     {
         // var bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
@@ -398,10 +402,31 @@ public static class LoadResources
             {
                 if (item.Obj == null)
                 {
+                    // [2026-10-03] 与 PC 侧语义对齐：先 AllGUIDDict（mod 对象），再查**游戏注册表**
+                    // —— Windy 的"精灵能力"就是靠 GSM 改造**游戏自带**卡牌（采摘/编织/缠线/粘土…）。
                     if (AllGUIDDict.TryGetValue(item.CardDirOrGuid, out var obj))
+                    {
                         item.Obj = obj;
+                    }
                     else
-                        continue;
+                    {
+                        var reg = UniqueIDScriptable.AllUniqueObjects;
+                        if (reg != null && reg.TryGetValue(item.CardDirOrGuid, out var gameObj) && gameObj != null)
+                            item.Obj = gameObj;
+                        else
+                            continue;
+                    }
+                }
+
+                // [2026-10-03] 目标若是游戏自带对象，包装类型常是基类 UniqueIDScriptable →
+                // 字段表（gen）会拿不到 DismantleActions 等字段。这里统一先按真实类名重建代理，
+                // 后面「采样 / warp / 字段存在性检查」都用具体类型。
+                try
+                {
+                    if (Diag.Retype(item.Obj) is ScriptableObject retypedObj) item.Obj = retypedObj;
+                }
+                catch
+                {
                 }
 
                 var processingScriptableObjectPack = item;
@@ -422,7 +447,42 @@ public static class LoadResources
                         JsonUtility.FromJsonOverwrite(item.CardData.ToJson(), item.Obj);
                     }
 
+                    // [GSM 判据] 改造前/后逐字段对比：`[GSM] 柠檬草(guid): Actions 3→5 ✓ / DroppedCards 2→4 ✓`
+                    // 这是"精灵能力到底改没改到"的唯一客观证据（Lead 指定：日志里的数字才算判据）。
+                    // [GSM 判据] 改造前/后**内容级**对比（条数 + 元素名字，例如"让风精灵采摘柠檬草"）；
+                    // Lead 指定：内容/条数/值任一变化即算成功；未变化时额外 dump 消费端收到的 warp 对。
+                    List<string> gsmFieldNames = null;
+                    Dictionary<string, string> gsmBefore = null;
+                    if (MiniLoader.DiagLean && !string.IsNullOrEmpty(item.CardDirOrGuid))
+                    {
+                        try
+                        {
+                            var pairs = Diag.GsmFieldsOf(json);
+                            gsmFieldNames = new List<string>();
+                            foreach (var (fld, _, _, _) in pairs) gsmFieldNames.Add(fld);
+                            if (gsmFieldNames.Count > 0)
+                            {
+                                gsmBefore = Diag.FieldSnapshot(item.Obj, gsmFieldNames);
+                                GsmSeen++;
+                            }
+                            else
+                            {
+                                gsmFieldNames = null;
+                            }
+                        }
+                        catch
+                        {
+                            gsmFieldNames = null;
+                        }
+                    }
+
                     WarpFunc.JsonCommonWarpper(item.Obj, json);
+
+                    if (gsmFieldNames != null)
+                    {
+                        try { Diag.LogGsmEntry(GsmSeen, GsmTotalExpected, item.Obj, item.CardDirOrGuid, json, gsmBefore); }
+                        catch { }
+                    }
                 }
 
                 if (item.Obj is CardData cardData)

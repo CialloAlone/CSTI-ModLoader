@@ -485,3 +485,125 @@ ICallFix 不在（或其回归导致启动崩溃）时它返回 null，回退的
 | **总** | **58,364 ms** | **41,051 ms** |
 → lean 省 **17.3 秒（−30%）**；诊断已不再是瓶颈，剩下 26 秒是 **warp 本体**（692k 键 / 116k 写入）。
 设备 prefs 现设为 `DiagLevel = "lean"`（`/storage/emulated/0/MelonLoader/<包名>/UserData/MelonPreferences.cfg`）。
+---
+
+## 20. GameSourceModify（改造游戏原有卡牌）：机制与修复（2026-10-03 00:31 本地完成，待 Lead 真机验收）
+
+**为什么重要**：用户报"精灵能力不生效"（采摘柠檬草/芦荟/卡瓦/大叶仙茅/蜘蛛兰/椰子树/大树/热带杏仁树，
+纤维缠细线、棕榈叶编织、泥堆→粘土）—— 这些**不是新卡**，而是把新动作/新掉落**追加到游戏原有卡上**，
+走的正是 `GameSourceModify`（GSM）。而我们的 GSM 一直是 **inert**（`[GSM] … 保持inert=63` ✗）。
+
+**文件结构（离线解包实证）**：`GameSourceModify/<组名>/<目标游戏卡 GUID>.json`，文件名 = 目标卡的 `UniqueID`。
+- 分组：`windy 17 / bow 14 / combat_windy 8 / env 6 / locat 6 / tinder 6 / item 3 / accompany 1 / weather 1 / Modify_TemperaturePerceived_Desert 1` = **63**
+- 被改字段：**`DismantleActions 48` / `CardInteractions 8` / `ExplorationResults 3` / `SpawningBlockedBy 3` / `SpoilageTime 1`**
+- `WarpType`：`4=ADD`（追加，多数）/ `5=MODIFY`（先清空再填）
+  ※ 枚举实际是 `NONE,COPY,CUSTOM,REFERENCE,**ADD=4**,MODIFY=5,ADD_REFERENCE=6` —— 早前笔记把 4 记成 MODIFY 是**错的**。
+
+**根因（两处，缺一不可）**
+1. **目标没解析**：PC 侧 `ModLoader.cs:1243` 用 `AllGUIDDict.TryGetValue(Guid, out var obj)` —— PC 的 AllGUIDDict 含**全部**卡牌；
+   我们移植版的 AllGUIDDict **只登记 mod 对象**（游戏自带对象在 `UniqueIDScriptable.AllUniqueObjects`，
+   当初又用 `typeof(UniqueIDScriptable)` 注册，被 `RegObj` 的子类判定挡掉）→ 63 条全部拿不到对象 ✗。
+   **修**：`LoadArchMod` 生产端 + `LoadResources` 消费端都加"再查游戏注册表"的兜底 ✓。
+2. **对象元素追加不了**：GSM 的 `*WarpData` 元素是**完整对象**（不是 GUID 字符串），
+   而 `SetArrByWarpper<T>` 原来对每个元素一律 `ToString()` 当 GUID 解析 → 必然"解析到 0 项" ✗。
+   **修**：新增分支 —— 元素是对象时 `Diag.NewElementOf(typeof(T))` 按元素类型新建实例 →
+   `WarpFunc.JsonCommonWarpper` 递归填字段（含其内部 `*WarpData` 引用解析）→ 追加进数组 ✓。
+
+**判据（日志可读，全部数字）**
+```
+[GSM] 目标已解析(游戏注册表): <类> / <名字> / GUID=…            （前 12 条）
+[GSM] <类> <名字>(guid8): <字段> X→Y ✓ …                        （逐条，改前→改后）
+[GSM] <类> <名字>(guid8): 无字段条目变化（…）                    （改到标量字段时的兜底提示）
+[GSM] 有意修改汇总: 成功=N 无字段变化=M 失败=0 涉及对象=K + 清单
+[INVARIANT] … ；已排除 GSM 有意修改 K 个 ✓ 尺寸与内容均完全不变
+```
+**"有意改动"与"意外污染"分离**：`Diag.IntentionalGuids` 登记被改对象的 GUID，
+`CompareGameContainers` 按 `类|GUID` 跳过它们 ✓，清单单独打印 ✓；其余对象仍要求 0 变化 ✓。
+**健壮性**：消费者本来就 per-item `try/catch` ✓，单条失败只记日志继续 ✓；新建实例失败另打
+`[ARR] 无法为对象元素新建实例: … 元素类型=T` ✓。
+---
+
+## 21. GSM 第二轮：两处安全问题的定位与修复（2026-10-03 00:38 本地完成，待真机复查）
+
+真机第一轮结果：`成功=62 无字段变化=1 失败=0 涉及对象=47`、`字段存在=False` 出现 0 次（Retype 修复生效 ✓），
+但暴露两个安全问题：
+
+### 问题 1：`[INVARIANT] 已排除 GSM 有意修改 0 个` —— **时序**问题
+`CompareGameContainers(invSnap, "warp 后")` 原来在 **STEP 4 之后、STEP 5（GSM 应用）之前**执行，
+此时 `IntentionalGuids` 还是空的 → 排除数必然 0（不是登记缺失、也不是 GUID 对不上）。
+- 键核对：快照键 = `RegistryByClass` 的 `kv.Key` = 游戏注册表 **GUID** ✓；`IntentionalGuids` 存的也是 GSM 目标 GUID ✓ → 同源可匹配 ✓。
+- 登记时机：`LogGsmEntry` 在**每条应用后立刻**登记 ✓（非汇总时）。
+- **修**：GSM 之后再跑一次判据 → `[INVARIANT] warp+GSM 后 …；GSM 有意修改目标总数=47，其中落在本次采样内=K（已排除）`。
+  采样是"每类 ≤20、共 76 个"，47 个目标不可能全在采样内 → **K < 47 是正常的**，两个数一起打出来才能判断"漏采"还是"排除没生效"。
+
+### 问题 2：`6 项[…] → 6 项[DismantleCardAction × 6]` —— 打印副作用（已加"无法含糊"的判定证据）
+- **打印副作用来源**：ADD 路径会**重建数组**（元素指针不变），读回时元素代理可能退化成基类/`Il2CppSystem.Object` → `ActionName` 取不到 → 回退成类名。
+- **修**：`ElemName` / `ElementDetails` 取值前先 `Diag.Retype(e)`；容器字段的改前/改后比较改用**逐元素明细**
+  （条数 + `ptr` + `ActionName.DefaultText` + `DaytimeCost` + `ProducedCards` + `RequiredCardsOnBoard` + `RequiredTagsOnBoard`）。
+- **判定口径**（Lead 指定）：同一元素改前/改后**指针与字段值完全一致 → 只是打印问题**；
+  任一不同 → 真损坏，须改为"只追加、绝不重建"。（当前 `ADD` 路径本就是 `原元素 + 新增`，不清空；只有 `MODIFY(5)` 会先清 —— 63 条里 17 条是 MODIFY，语义即"替换"。）
+---
+
+## 22. ⛔ 教训：绝不按"基址+偏移"直写非托管内存（2026-10-03 启动期 SIGSEGV）
+
+**做了什么**：为把 GSM 新增元素的**值类型字段**（`DaytimeCost` 是 int、`ActionName` 是内联 `LocalizedString`）
+填上，warp 里那条"故意跳过内联值类型"的安全跳过被我改成了**直写内存**：
+`Marshal.Write*(objPtr + tuple.fOffset, …)`，字符串用 `il2cpp_string_new` + 写屏障，结构递归写。
+
+**结果（真机）**：日志连续 10+ 条 `[INL] 内联值类型已直写: CardAction.ActionName = {空值}`，
+**随后进程直接消失** —— 没有 `后置复读`、没有 `有意修改汇总`、没有 `[INVARIANT]`、没有 `增量 206`。
+`ActionName` 写的是**空值**（JSON 没解出来/偏移不对），且**把内存写坏 → SIGSEGV**。
+
+**结论（永久生效）**：
+1. 原始实现里"跳过内联值类型"不是保守，而是**必须** —— 这条路走不通；
+2. 值类型字段只允许走**托管属性 setter**（`prop.SetValue`，运行时保证类型/GC 安全），
+   且默认**不开**（`CSTI_MiniLoader/GSM.InlineWrite=false`），失败就跳过并记 `[GSM] ⚠ 新增元素字段跳过`；
+3. 加载期任何"改造游戏对象"的整段代码都必须包 try/catch，**一条异常不许掀翻进程**；
+4. 提供 `CSTI_MiniLoader/GSM.Apply`（默认 true）作为"完全不碰游戏对象"的一键回退；
+5. 值类型内容的另一条安全路：直接调已确认可用的 ICall
+   `UnityEngine.JsonUtility::FromJsonInternal(json, objPtr, il2cpp_type_get_object(il2cpp_class_get_type(cls)))`
+   —— **显式传真实类型**，绕开托管版 `FromJsonOverwrite` 用包装类型推断（`Cast<Il2CppSystem.Object>` 会让 Unity 看到 `System.Object`，一个字段都写不进）。
+
+**审计口径**（每次改完都要跑）：全项目 `.cs` 搜 `Marshal.Write|WriteInlineValue|il2cpp_field_set_value` → 必须 **0 处**。
+---
+
+## 23. GameSourceModify（精灵能力）五轮修复记 —— 从"全 inert"到"能力可用"
+
+**用户诉求**：精灵应能采摘柠檬草/芦荟/卡瓦/椰子树…、纤维缠细线、棕榈叶编织、泥堆→粘土。
+这些**不是新卡**，而是把新动作/掉落**追加到游戏原有卡牌**上 —— 机制是 `GameSourceModify`（63 条）。
+
+| 轮次 | 真机症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `本会改到游戏对象=0 保持inert=63` | 我们只查 `AllGUIDDict`（**只含 mod 对象**）；游戏自带对象在 `UniqueIDScriptable.AllUniqueObjects` | 生产端+消费端都加"再查游戏注册表"兜底 |
+| 2 | 目标解析成功但 **0 条写入**（无告警） | 目标是游戏对象 → 包成基类 `UniqueIDScriptable` → `GetOrGen(基类)` 无 `DismantleActions` → 每键 `continue` 静默跳过 | `WarpFunc` 入口 + 消费端统一 `Diag.Retype(obj)` |
+| 3 | 追加生效但**内容全空**（`ActionName="-"`） | ① **改错了分支**：`CommonSet` 对"对象元素数组"分派到 **`SetArrNoWarpper`**（不是 `SetArrByWarpper`）② warp 明确**跳过内联值类型** → `DaytimeCost`/`ActionName` 写不进 ③ 嵌套对象字段为 `null` 被跳过 | 改 `SetArrNoWarpper`：新建元素先 `Diag.DeserializeElement`（**无条件走 `JsonUtility::FromJsonInternal` ICall**，显式传真实类型）再 warp；嵌套对象 null 时先建出来挂上 |
+| 4 | **启动期 SIGSEGV**（进程消失） | 我一度用"基址+字段偏移"**直写非托管内存**填值类型 → 写坏内存 | **整条撤销**（永久），值类型只允许托管属性 setter，且默认关（`GSM_InlineWrite=false`）；GSM 整段 try/catch；新增 `GSM_Apply` 一键回退 |
+| 5 | 能力名进游戏 ✓（`让风精灵摘点叶子。`）但 **7 个原元素引用被替换** | 新建元素反序列化已填好普通容器，紧接着的**普通 warp 又按 ADD 重建**它们 | 新建元素改用 `JsonWarpKeysOnly`（只处理 `*WarpType`＝只解 `*WarpData` 引用），MODIFY 就地改、绝不清空/不换引用 |
+| 6 | 残留判据是否可信 | 托管索引器读原元素抛异常被 `catch {}` 吞掉 → 可能误报 | 判据改**裸读原数组槽位**（与写回同一套偏移）+ ⚠ 行加 `阶段=` / `调用来源=`（前三帧栈）→ 真机确认是**真丢引用**（`读取失败=0`） |
+| 7 | 7 处仍丢 | 反射/包装器（`RuntimeMethodInfo.InternalInvoke`）绕过 `JsonCommonWarpper` 主循环的 `WarpKeysOnly` 守卫 | 守卫**下沉到 4 个数组/List 函数内部**（`WarpKeysOnly` 为真时只允许空容器被填）→ 真机 `拦下的非空重建=0`，**守卫未触发**，残留接受 |
+
+**最终真机判据**：`元素反序列化 成功=200 失败=0`、`FromJsonInternal 成功=200 失败=0`、
+中文明能力名已在游戏内（隐匿气息撤退 / 紧紧握在手中(点火) / 让风精灵摘点叶子。…）、
+`[INVARIANT] 0 变化 ✓`、`失败=0 ✓`、`增量 206 ✓`、未崩 ✓。
+
+### 已知残留（**未解决**，按 Lead 决定不再深挖）
+
+最终真机（第 6/7 版）：`引用保留核对 372039/372046` —— **7 个嵌套 ADD 容器的元素引用被重建**，集中在
+`CardsDropCollection.CardDropChanceModifiers`(1→1) / `GameStat.TimeOfDayMods`(2→2) / `ExtraDurabilityChange.NOTAffectedThings`(3→4)，
+`模式=ADD`，`阶段=新建元素追加(Array)`，`调用来源=SetArrNoWarpper<…> ← RuntimeMethodInfo.InternalInvoke`。
+
+**为什么没修掉（如实记录）**：
+- 第 6 轮把判据从托管索引器改为**裸读原数组槽位**（排除"读取异常被 catch 吞掉 → 误报"），真机给的是 `读取失败=0`
+  → **确认是真丢引用**，不是判据假象；
+- 第 7 轮把守卫下沉到 `SetArrByWarpper` / `SetArrNoWarpper` / `SetLiByWarpper` / `SetLiNoWarpper` 函数内部
+  （"`WarpKeysOnly` 为真时只允许空容器被填、绝不允许非空容器被重建"），覆盖反射/生成包装器那条调用链；
+  真机结果 `只解引用阶段拦下的非空重建=0` → **守卫根本没被触发** ✗ → 这些重建来自**另一个阶段**，
+  继续追必须动"值类型写入 / 数组写回"两个**已知危险区**（本项目已因此崩溃两次）。
+- **影响评估**：被重建的元素内容**取自同一份 JSON**，用户可见能力不受影响（中文明能力名已在游戏内生效）；
+  风险/收益比 7 : 372046 → **接受为已知残留**。
+
+### 两条永久教训
+1. ⛔ **绝不按"基址 + 字段偏移"直写非托管内存**（见 §22）：真机启动期 SIGSEGV。值类型字段只能走托管属性 setter，
+   且默认关闭；加载期改造游戏对象的整段代码必须包 try/catch。
+2. ⚠ **"引用丢失"的判据不能只看托管索引器**：`existingArr[i]` 抛异常会被 `catch {}` 吞掉 → 计数变 0 →
+   伪装成"引用被替换"。要么裸读槽位（与写回同一套偏移），要么把读取失败单独计数（`读取失败=`）后再下结论。

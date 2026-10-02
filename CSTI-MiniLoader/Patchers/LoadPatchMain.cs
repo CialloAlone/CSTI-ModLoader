@@ -362,12 +362,31 @@ public static class LoadPatchMain
         catch (Exception e) { MelonLogger.Warning("[队列尺寸] 失败: " + e.Message); }
             LoadResources.WarpperAllEditorMods();
             StepDone("4 warp 全部 mod JSON（含名字索引首建）", swStep);
-            try { Diag.CompareGameContainers(invSnap, "warp 后"); }
+            try { Diag.CompareGameContainers(invSnap, "warp 后（GSM 前）"); }
             catch (Exception ie3) { MelonLogger.Warning("[INVARIANT] 对比失败: " + ie3.Message); }
             if (MiniLoader.DiagFull) try { Diag.DumpModPerkGroups(); Diag.DumpModPerksPostWarp(); }
             catch (Exception pge) { MelonLogger.Warning("[PG] 探针失败: " + pge.GetType().Name + " " + pge.Message); }
             MelonLogger.Msg("[STEP] 5 WarpperAllEditorGameSrouces");
-            LoadResources.WarpperAllEditorGameSrouces();
+            // ★ GSM 整段包 try/catch：任一条目异常只记日志继续，绝不让加载期异常掀翻整个进程
+            if (MiniLoader.GsmApply)
+            {
+                try
+                {
+                    LoadResources.WarpperAllEditorGameSrouces();
+                }
+                catch (Exception gsmEx)
+                {
+                    MelonLogger.Error("[GSM] 应用阶段异常（已吞掉，继续加载）: " + gsmEx.GetType().Name + " " + gsmEx.Message);
+                }
+            }
+            else
+            {
+                MelonLogger.Warning("[GSM] GSM.Apply=false，跳过 GameSourceModify（不改造游戏原有卡牌）");
+            }
+            // ★ [2026-10-03] GSM 是在**这一步**才写进游戏对象的（有意修改）。污染判据必须放在它**之后**跑，
+            //    否则 CompareGameContainers 看到的 IntentionalGuids 还是空的 → "已排除 0 个"（真机实测踩到）。
+            try { Diag.CompareGameContainers(invSnap, "warp+GSM 后"); }
+            catch (Exception ieGsm) { MelonLogger.Warning("[INVARIANT] GSM 后对比失败: " + ieGsm.Message); }
             MelonLogger.Msg("[STEP] 6 MatchAndWarpperAllEditorGameSrouce");
             LoadResources.MatchAndWarpperAllEditorGameSrouce();
             if (MiniLoader.DiagFull) try { Diag.DumpPerkTabGroups(4); }
@@ -388,6 +407,19 @@ public static class LoadPatchMain
             }
             MelonLogger.Msg("[STEP] 9 done  总耗时=" + swAll.ElapsedMilliseconds + "ms"
                             + "  最后一段(5~9)=" + swStep.ElapsedMilliseconds + "ms");
+            MelonLogger.Msg("[GSM] 引用保留核对: 原元素总数=" + WarpperClassGen.MainGenTools.GsmOriginalTotal
+                            + " 原样保留=" + WarpperClassGen.MainGenTools.GsmOriginalPreserved
+                            + ((WarpperClassGen.MainGenTools.GsmOriginalTotal == WarpperClassGen.MainGenTools.GsmOriginalPreserved) ? " ✓ 现有元素一个都没被换掉" : " ⚠ 有元素被替换（见 [ARR] 告警）"));
+            MelonLogger.Msg("[GSM] 安全通道统计: 属性setter成功=" + Diag.SafeSetterOk + " 失败=" + Diag.SafeSetterFail
+                            + " | FromJsonInternal 成功=" + Diag.FromJsonIcallOk + " 失败=" + Diag.FromJsonIcallFail
+                            + " | 元素反序列化 成功=" + Diag.DeserOk + " 失败=" + Diag.DeserFail
+                            + " | 只解引用阶段拦下的非空重建=" + WarpperClassGen.MainGenTools.KeysOnlyGuardSkips
+                            + " | GSM.Apply=" + MiniLoader.GsmApply + " GSM.InlineWrite=" + MiniLoader.GsmInlineWrite);
+            Diag.DumpGsmAppendedReadback();          // [GSM] 后置复读（排除打印时机造成的假空字段）
+            foreach (var sk in WarpperClassGen.WarpFunc.SkipKeySamples)
+                MelonLogger.Warning("[GSM] ⚠ 新增元素字段跳过: " + sk);
+            Diag.DumpGsmCoverage();
+            Diag.DumpIntentionalSummary();          // [GSM] 有意修改的游戏卡片清单（替代"意外污染"判据）
             MelonLogger.Msg("[CREATE] 创建路径统计: shim=" + LoadArchMod.ShimCreatedCount
                             + " fallback-clone=" + LoadArchMod.FallbackCloneCount + " fallback-new=" + LoadArchMod.FallbackCreatedCount
                             + " | UseOwnCreationFallback=" + MiniLoader.UseOwnCreationFallback
