@@ -158,6 +158,9 @@ namespace CSTI_MiniLoader
 
             // ---------- ④ 观察：特质页签的 ContainedPerks 有没有被游戏重写（供用户验收时判断时机）----------
             if (MiniLoader.InitDone) { try { Diag.CheckTabCountsTick(); } catch { } }
+
+            // ---------- ⑤ 维护作弊控制台的两张卡表（mod 卡可见性；幂等、每约 4 秒一次）----------
+            if (MiniLoader.InitDone) { try { CheatListFix.Tick(); } catch { } }
         }
 
         private static void LogErr(string what, Exception e)

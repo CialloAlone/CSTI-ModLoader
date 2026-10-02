@@ -339,6 +339,9 @@ public static class LoadPatchMain
             }
             catch (Exception ge) { MelonLogger.Warning("[GEN] 探针失败: " + ge.GetType().Name + " " + ge.Message); }
             StepDone("0~1 探针 + LoadGameResource", swStep);
+            var allDataBefore = Diag.AllDataCount();
+            MelonLogger.Msg("[ALLDATA] 加载 mod 前 DataBase.AllData 条目数 = " + allDataBefore
+                            + " | AddToGameDataBase=" + !MiniLoader.SkipGameDataBaseAdd);
             MelonLogger.Msg("[STEP] 2 LoadAllArchMod");
             Dictionary<string, (long Size, long Content, string Detail)> invSnap = null;
             try { invSnap = Diag.SnapshotGameContainers(20); }
@@ -385,6 +388,15 @@ public static class LoadPatchMain
             }
             MelonLogger.Msg("[STEP] 9 done  总耗时=" + swAll.ElapsedMilliseconds + "ms"
                             + "  最后一段(5~9)=" + swStep.ElapsedMilliseconds + "ms");
+            MelonLogger.Msg("[CREATE] 创建路径统计: shim=" + LoadArchMod.ShimCreatedCount
+                            + " fallback-clone=" + LoadArchMod.FallbackCloneCount + " fallback-new=" + LoadArchMod.FallbackCreatedCount
+                            + " | UseOwnCreationFallback=" + MiniLoader.UseOwnCreationFallback
+                            + " SkipShimCreation=" + MiniLoader.SkipShimCreation);
+            var allDataAfter = Diag.AllDataCount();
+            MelonLogger.Msg("[ALLDATA] DataBase.AllData 条目数 " + allDataBefore + " → " + allDataAfter
+                            + "（+ " + (allDataAfter - allDataBefore) + "）"
+                            + " | 本次经 loader 加入 = " + LoadArchMod.AllDataAddedCount
+                            + " | AddToGameDataBase=" + !MiniLoader.SkipGameDataBaseAdd);
             MelonLogger.Msg(Diag.SummaryLine());     // [DIAGSUM] 一行汇总（lean 下这是主判据）
             Diag.LogNameIndexSummary();              // [NAMEIDX-SUM] 名字索引命中汇总（替代逐条）
         }

@@ -171,6 +171,9 @@ public static class LoadArchMod
     /// <summary>二分 2a：是否跳过把 mod 对象加进游戏主数据表 DataBase.AllData。</summary>
     private static int SkipDbAddLogged;
 
+    /// <summary>已成功加入游戏主数据表 DataBase.AllData 的 mod 对象条数（判据用）。</summary>
+    public static int AllDataAddedCount;
+
     public static void LoadAllArchMod()
     {
         var sBuf = new StringBuilder();
@@ -219,26 +222,129 @@ public static class LoadArchMod
         return $"加载 {modName} 成功";
     }
 
-    /// <summary>通过 CstiICallFix.RealShims.CreateLike 克隆式创建（绕开被裁剪的 ScriptableObject ICall）。</summary>
+    /// <summary>
+    /// 创建 mod 的 ScriptableObject（绕开被裁剪的 `ScriptableObject::CreateScriptableObjectInstanceFromName` 等 ICall）。
+    ///
+    /// 两条路径（可用 MelonPreferences `CSTI_MiniLoader/UseOwnCreationFallback` 关掉兜底）：
+    ///   ① `shim`     —— 反射调 `CstiICallFix.RealShims.CreateLike`（模板克隆，历史主路径）；
+    ///   ② `fallback` —— **不依赖任何 mod 的自带兜底**：按真实 il2cpp 类 `il2cpp_object_new` 建**空实例**，
+    ///      随后照常走「字段初始化 + 深拷贝去共享 + warp」把数据填上。
+    ///      （与 ① 的语义差异：① 克隆模板会带模板的初始字段值，② 是空实例；对 mod 对象两者都要被
+    ///        NeutralizeClone 深拷贝 + warp 覆盖，因此结果等价 —— 2026-10-02 与 Lead 确认。）
+    /// 为什么要 ②：CSTI-MiniLoader 曾经**硬依赖 CstiICallFix**，ICallFix 不在（或其回归导致启动崩溃）时
+    /// 204 个 mod 对象一个都建不出来（实测 `增量 0`）。
+    /// </summary>
     public static object CreateScriptableObjectViaShim(Type type)
     {
-        try
+        if (type == null) return null;
+
+        // ── 路径 ①：ICallFix 的真 shim ──
+        if (!MiniLoader.SkipShimCreation)
         {
-            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+            try
             {
-                Type k = null;
-                try { k = a.GetType("CstiICallFix.RealShims"); } catch { }
-                if (k == null) continue;
-                var m = k.GetMethod("CreateLike", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                if (m == null) continue;
-                var o = m.Invoke(null, new object[] { type });
-                if (o != null) return o;
-                break;
+                foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type k = null;
+                    try { k = a.GetType("CstiICallFix.RealShims"); } catch { }
+                    if (k == null) continue;
+                    var m = k.GetMethod("CreateLike",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                    if (m == null) continue;
+                    var o = m.Invoke(null, new object[] { type });
+                    if (o != null)
+                    {
+                        ShimCreatedCount++;
+                        if (ShimPathLogged.Add(type.Name))
+                            MelonLogger.Msg("[CREATE] 创建路径=shim   " + type.Name + "（ICallFix.RealShims.CreateLike）");
+                        return o;
+                    }
+
+                    break;   // 找到类但返回 null → 落到兜底
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[ARCH] CreateScriptableObjectViaShim(shim 路径) 失败: "
+                                    + e.GetType().Name + " " + e.Message);
             }
         }
-        catch (Exception e) { MelonLogger.Warning("[ARCH] CreateScriptableObjectViaShim 失败: " + e.Message); }
+
+        // ── 路径 ②：自带兜底（不依赖 ICallFix）──
+        if (MiniLoader.UseOwnCreationFallback)
+        {
+            try
+            {
+                var cls = Diag.NativeClassOfPublic(type);
+                if (cls == IntPtr.Zero) cls = Diag.FindClassPtrByClassName(type.Name);
+
+                // ②a 先试「模板克隆」：与 ICallFix.CreateLike 同语义（保留 Unity 原生状态最稳），
+                //    但用**我们自己的**模板查找 + 已注册的 Object::Internal_CloneSingle。
+                var tmpl = Diag.FindTemplatePtrByClassName(type.Name);
+                if (tmpl != IntPtr.Zero)
+                {
+                    var fn = RawTexture.ResolveIcall("UnityEngine.Object::Internal_CloneSingle");
+                    if (fn != IntPtr.Zero)
+                    {
+                        unsafe
+                        {
+                            var del = (delegate* unmanaged[Cdecl]<IntPtr, IntPtr>)fn;
+                            var clone = del(tmpl);
+                            if (clone != IntPtr.Zero)
+                            {
+                                var managedClone = Activator.CreateInstance(type, new object[] { clone });
+                                if (managedClone != null)
+                                {
+                                    FallbackCloneCount++;
+                                    if (ShimPathLogged.Add(type.Name))
+                                        MelonLogger.Msg("[CREATE] 创建路径=fallback-clone " + type.Name
+                                                        + "（模板 0x" + tmpl.ToInt64().ToString("X")
+                                                        + " → 克隆 0x" + clone.ToInt64().ToString("X") + "）");
+                                    return managedClone;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ②b 最后兜底：空实例（数据靠 NeutralizeClone + warp 填）
+                if (cls != IntPtr.Zero)
+                {
+                    var ptr = IL2CPP.il2cpp_object_new(cls);
+                    if (ptr != IntPtr.Zero)
+                    {
+                        var managed = Activator.CreateInstance(type, new object[] { ptr });
+                        if (managed != null)
+                        {
+                            FallbackCreatedCount++;
+                            if (ShimPathLogged.Add(type.Name))
+                                MelonLogger.Msg("[CREATE] 创建路径=fallback-new " + type.Name
+                                                + "（il2cpp_object_new 0x" + ptr.ToInt64().ToString("X") + "）");
+                            return managed;
+                        }
+                    }
+                }
+                else if (FallbackMissLogged.Add(type.Name))
+                {
+                    MelonLogger.Warning("[CREATE] fallback 取不到 il2cpp 类: " + type.Name);
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[ARCH] CreateScriptableObjectViaShim(fallback 路径) 失败: "
+                                    + e.GetType().Name + " " + e.Message);
+            }
+        }
+
         return null;
     }
+
+    /// <summary>两条创建路径的计数与"只报一次"的集合（判据用）。</summary>
+    public static int ShimCreatedCount;
+    public static int FallbackCloneCount;
+    public static int FallbackCreatedCount;
+    private static readonly HashSet<string> ShimPathLogged = new();
+    private static readonly HashSet<string> FallbackMissLogged = new();
 
     public static void LoadModArchBLK(string blk, BinaryReader reader, string modName, int version)
     {
@@ -612,18 +718,29 @@ public static class LoadArchMod
                         if (!AllGUIDDict.ContainsKey(card_guid))
                         {
                             AllGUIDDict.Add(card_guid, card);
-                            // [二分 2a 2026-10-02] 不再把 mod 对象塞进**游戏自己的主数据表**。
-                            // 游戏的事件/掉落结算会遍历 DataBase.AllData，撞上我们这些
-                            // 「空容器 + 字段不全」的克隆卡就可能中途异常 → 选了没反应 / 没掉落。
+                            // [2026-10-02] 「是否写游戏主数据表 DataBase.AllData」现在是**开关**
+                            // （MelonPreferences: CSTI_MiniLoader/AddToGameDataBase，默认 true）。
+                            // 历史：当初"事件选了没给东西"的真凶是**浅拷贝共享污染**（嵌套 warp 原地改共享对象），
+                            // 已由「递归深拷贝 + 重开嵌套 warp」根治；"不写 AllData"只是当时的二分手段。
+                            // 现在深拷贝在位、[INVARIANT] 长期 0 变化，所以默认加回来
+                            // —— 猜测控制台/UI 列卡片正是遍历这张游戏主数据表。
                             if (MiniLoader.SkipGameDataBaseAdd)
                             {
                                 if (SkipDbAddLogged++ == 0)
-                                    MelonLogger.Msg("[DB] 二分 2a：跳过 GameLoad.Instance.DataBase.AllData.Add(card)"
+                                    MelonLogger.Msg("[DB] AddToGameDataBase=false：跳过 GameLoad.Instance.DataBase.AllData.Add(card)"
                                                     + "（mod 对象仍进 AllGUIDDict / 自建字典 / 游戏注册表 Init）");
                             }
                             else
                             {
-                                GameLoad.Instance.DataBase.AllData.Add(card);
+                                try
+                                {
+                                    GameLoad.Instance.DataBase.AllData.Add(card);
+                                    AllDataAddedCount++;
+                                }
+                                catch (Exception adde)
+                                {
+                                    MelonLogger.Warning("[DB] AllData.Add 失败: " + adde.GetType().Name + " " + adde.Message);
+                                }
                             }
                         }
 

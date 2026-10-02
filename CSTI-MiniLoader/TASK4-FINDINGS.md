@@ -426,3 +426,62 @@ Android 上 `Path.GetFileNameWithoutExtension` 不认反斜杠 → 整个路径�
 **实现要点**：守卫包在**干活之前**（不只是包 `MelonLogger`）—— 例如 `TraceLine` 在 lean/off 下直接 `return`（连字符串都不拼），
 `DumpJson/DumpEffectArray/DumpNamedArray/DumpGenFields` 入口即 `return`，逐条 `[NAMEIDX] ✓` 改为计数器 + 末尾一行汇总。
 全项目共 **27 处** `DiagFull/DiagLean` 守卫。
+---
+
+## 18. 去掉对 CstiICallFix 的硬依赖（22:23 本地完成，未推设备）
+
+**为什么**：`CreateScriptableObjectViaShim` 原来是**反射调 `CstiICallFix.RealShims.CreateLike`**；
+ICallFix 不在（或其回归导致启动崩溃）时它返回 null，回退的 `ScriptableObject.CreateInstance` 也失败
+→ **204 个 mod 对象一个都建不出来**（真机实测 `增量 0`、`[WARP统计]` 缺失、STEP-T 4 warp=9ms）。
+
+**改法**：`LoadArchMod.CreateScriptableObjectViaShim` 现在是**两条路径**，并各打计数：
+
+| 路径 | 实现 | 日志 |
+|---|---|---|
+| ① `shim` | 反射 `CstiICallFix.RealShims.CreateLike`（历史主路径，保持兼容） | `[CREATE] 创建路径=shim <类型>` |
+| ②a `fallback-clone` | **自带模板克隆**：`Diag.FindTemplatePtrByClassName` 从游戏注册表挑同类现成实例 → 已注册的
+`UnityEngine.Object::Internal_CloneSingle` ICall 克隆 → 包成代理（**与 ① 同语义**，保留 Unity 原生状态最稳） | `[CREATE] 创建路径=fallback-clone <类型>（模板 0x… → 克隆 0x…）` |
+| ②b `fallback-new` | 最后兜底：真实 il2cpp 类 `il2cpp_object_new` 建**空实例**（数据靠 NeutralizeClone + warp 填） | `[CREATE] 创建路径=fallback-new <类型>（il2cpp_object_new 0x…）` |
+
+末尾汇总行：`[CREATE] 创建路径统计: shim=N fallback-clone=N fallback-new=N | UseOwnCreationFallback=… SkipShimCreation=…`
+
+**新增 MelonPreferences**（`CSTI_MiniLoader/`）：
+- `UseOwnCreationFallback`（默认 **true**）：关掉即回到"只依赖 ICallFix"的老行为；
+- `SkipShimCreation`（默认 false）：置 true 可**强制只走自带兜底**，用于两条路径对照验收。
+
+**待验判据**（等 Lead 放行后推）：ICallFix 移出 `Mods/` 跑一轮 → `增量 204/206`、`[EFFECT2]` 非空、
+`[INVARIANT]` 0 变化；再把 ICallFix 放回 → 判据不变（两路径等价）。
+---
+
+## 19. 控制台看不到 mod 卡：真因与修法（22:38 真机验证）
+
+**真因（与最初猜测不同）**：控制台（`CstiCheatConsoleMobile/Patches.cs`）在列表为空时会**自己调用游戏方法**
+`__instance.FillCards()` 去填充 `CheatsManager.AllCards` ✓ —— 但那是"进档/开界面时只填一次"，
+我们 206 个 mod 对象**是之后才注册的** ✗ → 列表里永远没有 mod 卡（命中 0/174 ✗）。
+`GameLoad.Instance.DataBase.AllData` 它**根本不读** ✗（所以 `[ALLDATA] +206` 对可见性无用，但对别处仍有用，**保留** ✓）。
+
+**修法**：`CheatListFix.cs`（反射实现，不依赖 interop 类型视图）
+- 每约 4 秒（`HookFree.Tick`）观察 `CheatsManager.AllCards`：条目数 + 元素类型 + **mod 卡命中数/总数**；
+- 命中 = 0 时**调用游戏自己的 `FillCards()`**（冷却 20 秒，幂等；游戏在进档时会重建该表，所以需要长期维护）；
+- 两个开关（MelonPreferences）：`MaintainCheatLists`(true)、`CheatListsTriggerFill`(true)；
+- **我们不自己写游戏列表** ✗ —— 让游戏自己按它的卡库重建 ✓，因此 `[INVARIANT]` 保持 0 变化 ✓。
+
+**真机判据（22:36 Full / 22:38 Lean 两次都命中）**：
+```
+[CHEATLIST] CheatsManager.AllCards = 1906 项（元素类型=CardData）；mod 卡命中 = 0 / 174
+[CHEATLIST] 触发 FillCards 后 CheatsManager.AllCards = 2080 项（元素类型=CardData）；mod 卡命中 = 174 / 174
+[CHEATLIST] 触发 FillCards()（第 1 次）: 调用成功=True；mod 卡命中 0 → 174
+```
+（注：interop 编译期把 `AllCards` 看成 `List<InGameCardBase>` ✗，运行期反射实测元素类型是 **`CardData`** ✓ ——
+所以"把 mod CardData 手工塞进列表"在类型上其实成立，但**没必要** ✓。）
+
+**耗时对比（同一构建、同一包）**：
+| 段 | Full | Lean |
+|---|---|---|
+| 0~1 探针+LoadGameResource | 179 ms | 93 ms |
+| 2~3 arch 解析+编辑器对象 | 16,679 ms | 14,388 ms |
+| **4 warp 全部 mod JSON（含名字索引首建）** | **41,067 ms** | **26,286 ms** |
+| 5~9 | 437 ms | 280 ms |
+| **总** | **58,364 ms** | **41,051 ms** |
+→ lean 省 **17.3 秒（−30%）**；诊断已不再是瓶颈，剩下 26 秒是 **warp 本体**（692k 键 / 116k 写入）。
+设备 prefs 现设为 `DiagLevel = "lean"`（`/storage/emulated/0/MelonLoader/<包名>/UserData/MelonPreferences.cfg`）。

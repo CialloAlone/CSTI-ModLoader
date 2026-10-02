@@ -129,7 +129,33 @@ public class MiniLoader : MelonMod
                 "lean" => DiagLevel.Lean,
                 _ => DiagLevel.Full
             };
-            MelonLogger.Msg("[DIAGLVL] 诊断级别 = " + Diag + "（配置 CSTI_MiniLoader/DiagLevel）");
+
+            // mod 对象是否写进游戏主数据表（默认 true）
+            var addEntry = cat.CreateEntry("AddToGameDataBase", true,
+                "把 mod 对象加进游戏主数据表 DataBase.AllData（控制台/UI 列卡片需要）");
+            SkipGameDataBaseAdd = !addEntry.Value;
+
+            // 自带创建兜底（不依赖 CstiICallFix），默认 true
+            var ownEntry = cat.CreateEntry("UseOwnCreationFallback", true,
+                "找不到 ICallFix.RealShims.CreateLike 时用 il2cpp_object_new 自带兜底创建 mod 对象");
+            UseOwnCreationFallback = ownEntry.Value;
+
+            var skipShimEntry = cat.CreateEntry("SkipShimCreation", false,
+                "禁用 ICallFix 的 shim 创建路径（只用自带兜底，便于两条路径对照验收）");
+            SkipShimCreation = skipShimEntry.Value;
+
+            // 控制台卡表维护（mod 卡可见性），默认 true
+            var cheatEntry = cat.CreateEntry("MaintainCheatLists", true,
+                "在泵里把 mod 卡牌补进 CheatsManager.AllCards / GameManager.AllCards（控制台能搜到）");
+            MaintainCheatLists = cheatEntry.Value;
+            var fillEntry = cat.CreateEntry("CheatListsTriggerFill", true,
+                "mod 卡不在控制台列表时调用游戏 FillCards() 重填一次");
+            CheatListsTriggerFill = fillEntry.Value;
+
+            MelonLogger.Msg("[DIAGLVL] 诊断级别 = " + Diag + "（配置 CSTI_MiniLoader/DiagLevel）"
+                            + " | AddToGameDataBase=" + !SkipGameDataBaseAdd
+                            + " | UseOwnCreationFallback=" + UseOwnCreationFallback
+                            + " | SkipShimCreation=" + SkipShimCreation + " | MaintainCheatLists=" + MaintainCheatLists);
         }
         catch (Exception e)
         {
@@ -151,11 +177,36 @@ public class MiniLoader : MelonMod
     public static bool SkipInit = false;
 
     /// <summary>
-    /// 二分 2a 开关：不把 mod 对象加进游戏自己的主数据表（`GameLoad.Instance.DataBase.AllData`）。
-    /// 游戏的事件/掉落结算会遍历它，撞上「空容器 + 字段不全」的克隆卡就可能中途异常。
-    /// mod 对象仍然进 AllGUIDDict / 自建字典 / 游戏注册表（Init 时）。
+    /// 是否把 mod 对象加进**游戏自己的主数据表**（`GameLoad.Instance.DataBase.AllData`）。
+    /// 由 MelonPreferences `CSTI_MiniLoader/AddToGameDataBase` 驱动，**默认 true**（= 加进去）。
+    /// 历史：早期浅拷贝共享污染导致"事件选了没反应/没掉落"，"不写 AllData"只是当时的二分手段；
+    /// 现在递归深拷贝 + 重开嵌套 warp 已根治（`[INVARIANT]` 长期 0 变化），故默认加回来
+    /// —— 控制台/UI 列卡片很可能正是遍历这张表。
     /// </summary>
-    public static bool SkipGameDataBaseAdd = true;
+    public static bool SkipGameDataBaseAdd;
+
+    /// <summary>
+    /// 是否启用**自带创建兜底**（`LoadArchMod.CreateScriptableObjectViaShim` 的第二条路径）：
+    /// 反射找不到 `CstiICallFix.RealShims.CreateLike` 或它返回 null 时，用真实 il2cpp 类
+    /// `il2cpp_object_new` 建空实例 —— 让 loader **不再硬依赖 CstiICallFix**。
+    /// MelonPreferences：`CSTI_MiniLoader/UseOwnCreationFallback`（默认 true）。
+    /// </summary>
+    public static bool UseOwnCreationFallback = true;
+
+    /// <summary>是否允许走 ICallFix 的 shim 创建路径（`CSTI_MiniLoader/SkipShimCreation`，默认 false=允许）。</summary>
+    public static bool SkipShimCreation;
+
+    /// <summary>
+    /// 是否在泵里幂等维护作弊控制台的两张卡表（`CheatsManager.AllCards` / `GameManager.AllCards`），
+    /// 让 mod 卡牌能在控制台里搜到。MelonPreferences：`CSTI_MiniLoader/MaintainCheatLists`（默认 true）。
+    /// </summary>
+    public static bool MaintainCheatLists = true;
+
+    /// <summary>
+    /// mod 卡不在控制台列表里时，是否调用游戏自己的 `CheatsManager.FillCards()` 重填一次（最多 3 次）。
+    /// MelonPreferences：`CSTI_MiniLoader/CheatListsTriggerFill`（默认 true）。
+    /// </summary>
+    public static bool CheatListsTriggerFill = true;
 
     /// <summary>是否把 LoadAndInit 延后到注册表就绪之后（推荐 true）。</summary>
     public static bool DeferredInit;

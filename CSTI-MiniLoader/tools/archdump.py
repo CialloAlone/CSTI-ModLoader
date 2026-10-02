@@ -407,11 +407,13 @@ def handler(name, r):
         print("   (未实现解析，跳过)")
 
 
-if "--gsm" in sys.argv:
-    analyze_gsm()
-else:
-    data = open(PATH, "rb").read()
-    print("文件大小 = %.1f MB" % (len(data) / 1048576.0))
-    seq = blocks(data)
-    print("\n== 区块顺序 ==")
-    print(" → ".join(n for n, _ in seq))
+if __name__ == "__main__":
+    # 作为库导入时不要执行（archverify.py 会 import 本文件的解码器）
+    if "--gsm" in sys.argv:
+        analyze_gsm()
+    else:
+        data = open(PATH, "rb").read()
+        print("文件大小 = %.1f MB" % (len(data) / 1048576.0))
+        seq = blocks(data)
+        print("\n== 区块顺序 ==")
+        print(" → ".join(n for n, _ in seq))

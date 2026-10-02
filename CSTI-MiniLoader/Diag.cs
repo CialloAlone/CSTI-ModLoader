@@ -927,6 +927,68 @@ public static class Diag
     }
 
     /// <summary>取 interop 代理类型对应的原生 Il2CppClass*。</summary>
+    public static IntPtr NativeClassOfPublic(Type t) => NativeClassOf(t);
+
+    private static readonly Dictionary<string, IntPtr> ClassPtrByNameCache = new();
+
+    /// <summary>找同类的**现成实例指针**（模板克隆用）—— 从游戏注册表里挑第一个同类对象。</summary>
+    public static IntPtr FindTemplatePtrByClassName(string clsName)
+    {
+        if (string.IsNullOrEmpty(clsName)) return IntPtr.Zero;
+        if (TemplatePtrCache.TryGetValue(clsName, out var cached)) return cached;
+        var found = IntPtr.Zero;
+        try
+        {
+            var reg = UniqueIDScriptable.AllUniqueObjects;
+            if (reg != null)
+                foreach (var kv in reg)
+                {
+                    var o = kv.Value;
+                    if (o == null) continue;
+                    var pp = IL2CPP.Il2CppObjectBaseToPtr(o);
+                    if (pp == IntPtr.Zero) continue;
+                    if (Cls(pp) != clsName) continue;
+                    found = pp;
+                    break;
+                }
+        }
+        catch
+        {
+        }
+
+        TemplatePtrCache[clsName] = found;
+        return found;
+    }
+
+    private static readonly Dictionary<string, IntPtr> TemplatePtrCache = new();
+    /// <summary>退路：从同类的现成实例借 il2cpp 类（例如注册表里就有该类型的对象时）。</summary>
+    public static IntPtr FindClassPtrByClassName(string clsName)
+    {
+        if (string.IsNullOrEmpty(clsName)) return IntPtr.Zero;
+        if (ClassPtrByNameCache.TryGetValue(clsName, out var cached)) return cached;
+        var found = IntPtr.Zero;
+        try
+        {
+            var reg = UniqueIDScriptable.AllUniqueObjects;
+            if (reg != null)
+                foreach (var kv in reg)
+                {
+                    var o = kv.Value;
+                    if (o == null) continue;
+                    var pp = IL2CPP.Il2CppObjectBaseToPtr(o);
+                    if (pp == IntPtr.Zero) continue;
+                    if (Cls(pp) != clsName) continue;
+                    found = IL2CPP.il2cpp_object_get_class(pp);
+                    break;
+                }
+        }
+        catch
+        {
+        }
+        ClassPtrByNameCache[clsName] = found;
+        return found;
+    }
+
     private static IntPtr NativeClassOf(Type interopType)
     {
         try
@@ -1845,6 +1907,29 @@ public static class Diag
         }
     }
 
+    /// <summary>
+    /// [ALLDATA 判据] 游戏主数据表 `GameLoad.Instance.DataBase.AllData` 的条目数。
+    /// 用于验证 mod 对象是否真的进了控制台/UI 会遍历的那张表；取不到返回 -1。
+    /// </summary>
+    public static int AllDataCount()
+    {
+        try
+        {
+            var db = GameLoad.Instance?.DataBase;
+            if (db == null) return -1;
+            var all = db.AllData;
+            if (all == null) return -1;
+            var t = all.GetType();
+            var p = t.GetProperty("Count") ?? t.GetProperty("Length");
+            if (p == null) return -1;
+            var v = p.GetValue(all);
+            return v == null ? -1 : Convert.ToInt32(v);
+        }
+        catch
+        {
+            return -1;
+        }
+    }
     /// <summary>把注册表对象安全转成具体代理类型（GetType() 常常只返回 UniqueIDScriptable）。</summary>
     public static T CastOrNull<T>(object o) where T : Il2CppObjectBase
     {
