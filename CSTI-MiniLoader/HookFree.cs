@@ -29,6 +29,7 @@ namespace CSTI_MiniLoader
         private static bool _gfxOnceDone;
         private static int _guideTries;
         private static int _gfxTries;
+        private static bool _deferLogged;
         private static bool _errLogged;
         private static bool _gfxChainLogged;
         private static int _gfxWaitLog;
@@ -45,7 +46,7 @@ namespace CSTI_MiniLoader
                 Type t = null;
                 foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    try { t = a.GetType("CstiICallFix.RealShims"); } catch { }
+                    try { t = a.GetType("CstiICallFix.RealShims"); } catch (Exception __e) { MelonLogger.Warning("[HookFree] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                     if (t != null) break;
                 }
                 if (t == null) { MelonLogger.Msg("[HOOKFREE] 未找到 CstiICallFix（跳过模板表预建）"); return; }
@@ -84,7 +85,7 @@ namespace CSTI_MiniLoader
                         Patchers.LoadPatchMain.LoadLocalizationPublic();
                         _locDone = true;
                         MelonLogger.Msg("[HOOKFREE] ① 本地化已注入（轮询，未使用 Harmony）");
-                        try { Diag.DumpLocalizationWindyKeys(); } catch { }
+                        try { Diag.DumpLocalizationModKeys(); } catch (Exception __e) { MelonLogger.Warning("[HookFree] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                     }
                     catch (Exception e) { LogErr("① 本地化注入", e); _locDone = false; }
                 }
@@ -110,6 +111,17 @@ namespace CSTI_MiniLoader
                 }
 
                 // ---------- ③ GraphicsManager（拿到实例后注入）----------
+                if (!_deferLogged)
+                {
+                    _deferLogged = true;
+                    var allDataNow = -1;
+                    try { allDataNow = (int)Diag.ElemCount(GameLoad.Instance.DataBase.AllData); } catch (Exception __e) { MelonLogger.Warning("[DEFER] 读 AllData 失败: " + __e.Message); }
+                    MelonLogger.Msg("[DEFER] 首次尝试: InitDone=" + MiniLoader.InitDone
+                                    + " DeferredInit=" + MiniLoader.DeferredInit
+                                    + " AllData 条目=" + allDataNow
+                                    + "（若这里还没就绪，说明延后是必须的；若已就绪却仍延后，就是我们的时序问题）");
+                }
+
                 if (!_gfxDone && (MiniLoader.InitDone || !MiniLoader.DeferredInit))
                 {
                     GraphicsManager gm = Pump.GraphicsInstance;   // 首选：由 GraphicsManager.Update 捕获
@@ -157,10 +169,10 @@ namespace CSTI_MiniLoader
             catch (Exception e) { LogErr("Tick", e); }
 
             // ---------- ④ 观察：特质页签的 ContainedPerks 有没有被游戏重写（供用户验收时判断时机）----------
-            if (MiniLoader.InitDone) { try { Diag.CheckTabCountsTick(); } catch { } }
+            if (MiniLoader.InitDone) { try { Diag.CheckTabCountsTick(); } catch (Exception __e) { MelonLogger.Warning("[HookFree] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); } }
 
             // ---------- ⑤ 维护作弊控制台的两张卡表（mod 卡可见性；幂等、每约 4 秒一次）----------
-            if (MiniLoader.InitDone) { try { CheatListFix.Tick(); } catch { } }
+            if (MiniLoader.InitDone) { try { CheatListFix.Tick(); } catch (Exception __e) { MelonLogger.Warning("[HookFree] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); } }
         }
 
         private static void LogErr(string what, Exception e)

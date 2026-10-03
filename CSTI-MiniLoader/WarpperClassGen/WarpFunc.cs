@@ -35,22 +35,8 @@ public static class WarpFunc
     /// 专供**新建元素**：那些字段已由 `Diag.DeserializeElement`（ICall）连原引用一起填好，
     /// 再走普通 warp 会按 ADD 重建数组 → 原元素引用丢失（真机 7 处）。
     /// </summary>
-    public static bool WarpKeysOnly;
 
     /// <summary>同上，但保证调用结束后恢复原值（可嵌套安全）。</summary>
-    public static void JsonWarpKeysOnly(object obj, KVProvider json)
-    {
-        var saved = WarpKeysOnly;
-        WarpKeysOnly = true;
-        try
-        {
-            JsonCommonWarpper(obj, json);
-        }
-        finally
-        {
-            WarpKeysOnly = saved;
-        }
-    }
     /// <summary>嵌套对象"新建并挂上"的次数（空动作修复②的判据）。</summary>
     public static int NestedCreated;
 
@@ -65,7 +51,8 @@ public static class WarpFunc
     {
         return "warp: 键=" + StatKeys + " 写入=" + StatSet + " 跳过(无字段)=" + StatSkipped
                + " 内部异常=" + StatEx + " 空gen表类型=" + StatEmptyType
-               + " List原地改已跳过=" + StatListSkipped + " 嵌套对象原地改已跳过=" + StatObjSkipped;
+               + " List原地改已跳过=" + StatListSkipped + " 嵌套对象原地改已跳过=" + StatObjSkipped
+               + " 托管结构写入=" + ManagedWrites + "(字段=" + ManagedFieldWrites + " 属性=" + ManagedPropWrites + ")";
     }
 
     public static void DumpSamples()
@@ -94,13 +81,29 @@ public static class WarpFunc
         var retyped = Diag.Retype(obj);
         if (retyped != null) obj = retyped;
 
+        // ★★ [2026-10-03 第 10 轮 · 真根因修复] **纯托管值类型副本（boxed struct）走"托管成员"通道**。
+        //    用 System.Reflection.Metadata 直接读设备上的 Il2CppAssemblies/Assembly-CSharp.dll 实证：
+        //    Il2CppInterop 对 il2cpp 值类型有两种生成形态 ——
+        //      · 含引用的（LocalizedString / CardInteractionTrigger）→ `Il2CppSystem.ValueType` 派生的**类 + 属性**；
+        //      · **blittable 的**（DurabilitiesConditions / DurabilityWeightValue / EncounterVariable /
+        //        EnemySkillModifier / LightSourceSettings / Vector2 / Color …）→ `ExplicitLayout` 的
+        //        **C# struct + public 字段**（没有属性）。
+        //    而这类结构的 JSON 键**大量是标量**（`{"SpecialNRange":{"x":0,"y":100}}`），主 warp 的每条分支
+        //    都只认 `*WarpData`/对象/容器 ⇒ 标量一律静默跳过 ⇒ 结构字段永远保持默认值
+        //    （真机 `prop=null` 95,180 行 / 30MB 日志的实质就是这一类）。
+        //    判据严格限定为"**不是** Il2CppObjectBase 的托管副本"：真 il2cpp 对象仍走原路径，行为不变。
+        if (obj is not Il2CppObjectBase)
+        {
+            ManagedStructWarp(obj, json);
+            return;
+        }
+
         var objType = obj.GetType();
         var genInfos = MainGen.GetOrGen(objType);
         if (genInfos.Count == 0)
         {
             StatEmptyType++;
-            if (StatSkipSample.Count < 5)
-                StatSkipSample.Add("gen 表为空（该类型没有任何 NativeFieldInfoPtr 字段）: " + objType.FullName);
+            StatSkipSample.Add("gen 表为空（该类型没有任何 NativeFieldInfoPtr 字段）: " + objType.FullName);
         }
 
         foreach (var key in json.Keys)
@@ -108,14 +111,21 @@ public static class WarpFunc
             StatKeys++;
             try
             {
+                var keyData = json[key];
+
                 // ★ [2026-10-03 第 5 轮] "只解引用"模式：新建元素已经用 `DeserializeElement`（ICall 反序列化）
                 //    把**普通容器/标量**（`CardDropChanceModifiers`/`TimeOfDayMods`/`NOTAffectedThings`…）
                 //    连同其**原始引用**一起填好了；若紧接着再走一遍普通 warp，ADD 逻辑会**重建这些数组** →
                 //    原元素引用丢失（真机实测 7 处）。所以这一步只处理 `*WarpType`（即 `*WarpData` 的解引用），
                 //    其它键一律不碰。开关只在"新建元素"路径上打开，正常 mod 对象不受影响。
-                if (WarpKeysOnly && !key.EndsWith("WarpType")) continue;
+                // ★ [2026-10-03 第 8 轮 · 用户级 bug 修复] "只解引用"模式**不能只跳普通标量**：
+                //    用户报"纤维/蛇草拖不到精灵身上"，真因就是交互判定字段藏在**嵌套对象**里：
+                //      `CompatibleCards: { TriggerCards: [], TriggerCardsWarpData: ["748f5b60…"],
+                //                          TriggerCardsWarpType: 3 }`
+                //    `CompatibleCards` 是普通对象键 → 被这里的 keys-only 守卫跳过 → 它的**内层**
+                //    `TriggerCardsWarpData` 永远不解引用 → `TriggerCards` 为空 → 拖拽永不匹配（用户看到的症状）。
+                //    所以：keys-only 下**放行对象/数组键**（只做"下潜解引用"，不重建容器），只跳真正的标量。
 
-                var keyData = json[key];
                 if (key.EndsWith("WarpType"))
                 {
                     if (!keyData.IsInt || !json.ContainsKey(key.Substring(0, key.Length - 8) + "WarpData"))
@@ -124,9 +134,8 @@ public static class WarpFunc
                     if (!genInfos.TryGetValue(fieldName, out var tuple))
                     {
                         StatSkipped++;
-                        if (SkipKeySamples.Count < 30)
-                            SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
-                        if (StatSkipSample.Count < 5) StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
+                        SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
+                        StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
                         continue;
                     }
                     var fieldWarpData = json[fieldName + "WarpData"];
@@ -147,9 +156,8 @@ public static class WarpFunc
                             StatSkipped++;
                             if (MiniLoader.DiagFull && fieldName is "DroppedCard" or "ActionName" or "ProducedCards")
                                 MelonLogger.Msg("[CHAIN]   ↳ 字段不在 gen 表: " + objType.Name + "." + fieldName);
-                            if (SkipKeySamples.Count < 30)
-                                SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
-                            if (StatSkipSample.Count < 5) StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
+                            SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
+                            StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
                             continue;
                         }
                         if (tuple.fldType.IsSubclassOf(typeof(UnityEngine.Object)))
@@ -161,17 +169,26 @@ public static class WarpFunc
                         //    打开后也只是 `prop.SetValue`（运行时保证类型/GC 安全），失败就跳过并记日志。
                         if (tuple.isValueType)
                         {
-                            if (MiniLoader.GsmInlineWrite &&
-                                Diag.TrySetManagedField(obj, fieldName, keyData))
+                            // ★★ [2026-10-03 第 9 轮 · 用户级 bug 修复] 内联结构**不再跳过**：
+                            //    `prop.GetValue` 取**托管代理** → 在代理上递归 warp
+                            //    （`TriggerCardsWarpData` 因此被解引用进 `TriggerCards`）→
+                            //    `prop.SetValue` 把**整块结构**写回字段。
+                            //    全程托管属性 setter：**不用字段偏移、不做 memcpy、不写裸内存**。
+                            //    真机证据：mod 卡 `Windy.CardInteractions` 37 项 TriggerCards/TriggerTags 全空
+                            //    → 用户"纤维/蛇草拖不到精灵身上"。
+                            if (MiniLoader.StructSetterFix && Diag.TrySetStructViaProxy(obj, fieldName, keyData))
+                            {
+                                StatSet++;
+                            }
+                            else if (MiniLoader.GsmInlineWrite && Diag.TrySetManagedField(obj, fieldName, keyData))
                             {
                                 StatSet++;
                             }
                             else
                             {
                                 StatSkipped++;
-                                if (SkipKeySamples.Count < 30)
-                                    SkipKeySamples.Add(objType.Name + "." + fieldName
-                                                       + "（内联值类型：安全通道未启用或属性 setter 不可用 → 跳过）");
+                                SkipKeySamples.Add(objType.Name + "." + fieldName
+                                                       + "（内联值类型：代理 setter 不可用 → 跳过，见 [INL] 告警）");
                             }
 
                             continue;
@@ -193,20 +210,14 @@ public static class WarpFunc
                             if (createdSub != null &&
                                 Diag.SetObjectField(obj, fieldName, createdSub))
                             {
-                                if (NestedCreated < 12)
-                                {
-                                    NestedCreated++;
-                                    MelonLogger.Msg("[INL] 嵌套对象已新建并挂上: " + objType.Name + "." + fieldName
-                                                    + " 类型=" + tuple.fldType.Name);
-                                }
+                                NestedCreated++;   // [条件筛选] 成功只计数（逐条打会刷屏）
 
                                 subObj = createdSub;
                             }
                             else
                             {
                                 StatSkipped++;
-                                if (SkipKeySamples.Count < 30)
-                                    SkipKeySamples.Add(objType.Name + "." + fieldName + "（嵌套对象为 null 且新建失败）");
+                                SkipKeySamples.Add(objType.Name + "." + fieldName + "（嵌套对象为 null 且新建失败）");
                                 continue;
                             }
                         }
@@ -225,7 +236,7 @@ public static class WarpFunc
                         if (!genInfos.TryGetValue(fieldName, out var tuple))
                         {
                             StatSkipped++;
-                            if (StatSkipSample.Count < 5) StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
+                            StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
                             continue;
                         }
 
@@ -233,6 +244,11 @@ public static class WarpFunc
                         {
                             if (keyData[i].IsObject)
                             {
+                                // ★ [2026-10-03 第 8 轮] 只解引用模式：**下潜到既有元素**解它们的内部引用，
+                                //    绝不走 CommonSet/SetArrNoWarpper（那会按 ADD 重建数组 → 丢原引用）。
+                                //    例：`CompatibleCards.TriggerCards` 空 → `TriggerCardsWarpData` 需解引用；
+                                //    以及 `ReceivingCardChanges[].TransformIntoWarpData` 这类元素内部引用。
+
                                 if (tuple.fldType.IsGenericType &&
                                     tuple.fldType.GetGenericTypeDefinition() == typeof(List<>))
                                 {
@@ -328,8 +344,117 @@ public static class WarpFunc
             catch (Exception inner)
             {
                 StatEx++;
-                if (StatExSample.Count < 5)
-                    StatExSample.Add(objType.Name + "." + key + " → " + inner.GetType().Name + ": " + inner.Message);
+                // 无上限：异常采样全量记录 + 直接告警（零静默）
+                StatExSample.Add(objType.Name + "." + key + " → " + inner.GetType().Name + ": " + inner.Message);
+                Diag.NoteInlineIssue(objType.Name + "." + key + "|warp 异常",
+                    inner.GetType().Name + " " + inner.Message);
+            }
+        }
+    }
+
+    // ═══════════ 纯托管值类型副本（boxed struct）：按**托管成员**逐键 warp ═══════════
+    /// <summary>本轮经"托管成员"通道写进结构副本的键数（判据用；成功只计数，不逐条打）。</summary>
+    public static int ManagedWrites;
+    /// <summary>其中经 **public 字段**写进去的键数（blittable 值类型那条路，正是本轮修好的）。</summary>
+    public static int ManagedFieldWrites;
+    /// <summary>其中经 **属性**写进去的键数。</summary>
+    public static int ManagedPropWrites;
+
+    /// <summary>
+    /// `DurabilitiesConditions` / `DurabilityWeightValue` / `EncounterVariable` / `EnemySkillModifier` /
+    /// `LightSourceSettings` / `Vector2` / `Color` 这类 **blittable 值类型**在设备上的 interop 程序集里是
+    /// `ExplicitLayout` 的 **C# struct + public 字段**（没有属性）。主 warp 只处理
+    /// `*WarpData` / 对象 / 数组，**标量一律跳过** —— 而这些结构的 JSON 键大量是标量（`x`/`y`/`r`/`g`/`b`/`Active`…）
+    /// ⇒ 旧逻辑静默跳过 ⇒ 字段永远保持默认值。
+    /// 这里按**托管成员**（属性优先、public 字段兜底）逐键写：对象键递归、标量键精确转换。
+    /// 只用托管反射，**零字段偏移、零裸内存**。
+    /// </summary>
+    public static void ManagedStructWarp(object obj, KVProvider json, int depth = 0)
+    {
+        if (obj == null || json == null || !json.IsObject) return;
+        if (depth > 8)   // 环保护（值类型本身不成环，但成员可能是类实例）
+        {
+            Diag.NoteInlineIssue(obj.GetType().Name + "|托管结构递归过深", "depth=" + depth + "（已停止下潜）");
+            return;
+        }
+
+        var t = obj.GetType();
+        foreach (var key in json.Keys)
+        {
+            StatKeys++;
+            try
+            {
+                if (key.EndsWith("WarpData")) continue;   // 引用 warp 键由主路径处理，纯托管结构不涉及
+                var kd = json[key];
+                if (!Diag.TryReadMember(obj, key, out var cur, out var mt, out var canWrite, out var viaField))
+                {
+                    StatSkipped++;
+                    Diag.NoteInlineIssue(t.Name + "." + key + "|托管结构无此成员",
+                        "interop 结构里没有该名字的属性/字段 → 该键未写入");
+                    continue;
+                }
+
+                if (viaField) ManagedFieldWrites++;
+                else ManagedPropWrites++;
+
+                if (!canWrite)
+                {
+                    StatSkipped++;
+                    Diag.NoteInlineIssue(t.Name + "." + key + "|托管成员只读", "该结构成员没有 setter");
+                    continue;
+                }
+
+                if (kd.IsObject)
+                {
+                    if (cur == null)
+                    {
+                        cur = mt is { IsValueType: true } ? Activator.CreateInstance(mt) : Diag.NewElementOf(mt);
+                        if (cur == null)
+                        {
+                            StatSkipped++;
+                            Diag.NoteInlineIssue(t.Name + "." + key + "|子结构实例创建失败",
+                                "类型=" + (mt?.Name ?? "?"));
+                            continue;
+                        }
+                    }
+
+                    ManagedStructWarp(cur, kd, depth + 1);          // 递归填子结构
+                    if (Diag.TryWriteMember(obj, key, cur))
+                    {
+                        StatSet++;
+                        ManagedWrites++;
+                    }
+                    else
+                    {
+                        StatSkipped++;
+                        Diag.NoteInlineIssue(t.Name + "." + key + "|子结构写回被拒", "类型=" + (mt?.Name ?? "?"));
+                    }
+                }
+                else if (Diag.TryConvertScalar(mt, kd, out var val))
+                {
+                    if (Diag.TryWriteMember(obj, key, val))
+                    {
+                        StatSet++;
+                        ManagedWrites++;
+                    }
+                    else
+                    {
+                        StatSkipped++;
+                        Diag.NoteInlineIssue(t.Name + "." + key + "|标量写回被拒",
+                            "目标类型=" + (mt?.Name ?? "?") + " 值=" + kd);
+                    }
+                }
+                else
+                {
+                    StatSkipped++;
+                    Diag.NoteInlineIssue(t.Name + "." + key + "|托管结构键未处理",
+                        (kd.IsArray ? "数组键" : "标量类型不支持") + " 目标类型=" + (mt?.Name ?? "?"));
+                }
+            }
+            catch (Exception e)
+            {
+                StatEx++;
+                Diag.NoteInlineIssue(t.Name + "." + key + "|托管结构 warp 异常", e.GetType().Name + " " + e.Message);
             }
         }
     }

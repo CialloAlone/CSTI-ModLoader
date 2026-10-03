@@ -50,12 +50,17 @@ public static class LoadPatchMain
                         var currentTexts = LocalizationManager.CurrentTexts;
                         var dictionary = CSVParser.LoadFromString(pair.Item2);
                         foreach (var keyValuePair in dictionary)
+                        {
+                            // [2026-10-03 通用化] 按**来源**（mod 包的 CSV）登记键，不按 mod 名字 →
+                            // [L10N] 判据对任何 mod 都成立：注入键数 / 真的进了 LocalizationManager 的数量。
+                            Diag.NoteModLocalizationKey(keyValuePair.Key);
                             if (!currentTexts.ContainsKey(keyValuePair.Key) && keyValuePair.Value.Count >= 2)
                             {
                                 var chLocal = regex.Replace(keyValuePair.Value[1], "\n");
                                 if (!string.IsNullOrWhiteSpace(chLocal.Trim()))
                                     currentTexts.Add(keyValuePair.Key, chLocal);
                             }
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -72,12 +77,15 @@ public static class LoadPatchMain
                         var currentTexts = LocalizationManager.CurrentTexts;
                         var dictionary = CSVParser.LoadFromString(pair.Item2);
                         foreach (var keyValuePair in dictionary)
+                        {
+                            Diag.NoteModLocalizationKey(keyValuePair.Key);   // 同上：按来源登记
                             if (!currentTexts.ContainsKey(keyValuePair.Key) && keyValuePair.Value.Count >= 2)
                             {
                                 var enLocal = regex.Replace(keyValuePair.Value[0], "\n");
                                 if (!string.IsNullOrWhiteSpace(enLocal.Trim()))
                                     currentTexts.Add(keyValuePair.Key, enLocal);
                             }
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -413,11 +421,15 @@ public static class LoadPatchMain
             MelonLogger.Msg("[GSM] 安全通道统计: 属性setter成功=" + Diag.SafeSetterOk + " 失败=" + Diag.SafeSetterFail
                             + " | FromJsonInternal 成功=" + Diag.FromJsonIcallOk + " 失败=" + Diag.FromJsonIcallFail
                             + " | 元素反序列化 成功=" + Diag.DeserOk + " 失败=" + Diag.DeserFail
-                            + " | 只解引用阶段拦下的非空重建=" + WarpperClassGen.MainGenTools.KeysOnlyGuardSkips
+                            + " | 内联结构代理写回 成功=" + Diag.StructProxyWrites + " 失败=" + Diag.StructProxyFails
                             + " | GSM.Apply=" + MiniLoader.GsmApply + " GSM.InlineWrite=" + MiniLoader.GsmInlineWrite);
             Diag.DumpGsmAppendedReadback();          // [GSM] 后置复读（排除打印时机造成的假空字段）
             foreach (var sk in WarpperClassGen.WarpFunc.SkipKeySamples)
                 MelonLogger.Warning("[GSM] ⚠ 新增元素字段跳过: " + sk);
+            foreach (var rm in Diag.ResolveMisses) MelonLogger.Warning(rm);
+            MelonLogger.Msg("[RESOLVE] 未解析汇总: " + Diag.ResolveMisses.Count + " 条（完整清单；0 = 所有引用都解析成功）");
+            Diag.DumpInlineIssues();             // [INL] 条件筛选：成功计数 + 失败去重计数（不刷屏、不 cap）
+            Diag.DumpModCardInteractions();      // [MODCARD] 精灵卡交互 dump（用户级 bug 定案）
             Diag.DumpGsmCoverage();
             Diag.DumpIntentionalSummary();          // [GSM] 有意修改的游戏卡片清单（替代"意外污染"判据）
             MelonLogger.Msg("[CREATE] 创建路径统计: shim=" + LoadArchMod.ShimCreatedCount
@@ -446,9 +458,7 @@ public static class LoadPatchMain
             MelonLogger.Msg("[STEP-T] " + label + " 耗时=" + sw.ElapsedMilliseconds + "ms");
             sw.Restart();
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
     }
 
     private static void AddPerkGroup()
@@ -456,7 +466,7 @@ public static class LoadPatchMain
         // 诊断：为什么「新特质看不到」——先看查表用的是什么键
         var dict = ItemDictionary(typeof(PerkGroup));
         MelonLogger.Msg("[PERK] ItemDictionary(PerkGroup) 条目=" + dict.Count
-                        + " 键=[" + string.Join(", ", dict.Keys.Take(6)) + "]");
+                        + " 键=[" + string.Join(", ", dict.Keys) + "]");
 
         // 关键修复：用 il2cpp 真实类名把游戏自带的 PerkGroup 从注册表里捞出来，按「名字」建索引。
         // 原版靠 Resources.FindObjectsOfTypeAll 把非 UniqueIDScriptable 的对象按 .name 注册；
@@ -465,7 +475,7 @@ public static class LoadPatchMain
         var byName = Diag.BuildPerkGroupIndex(out var scanned, out var matched);
         MelonLogger.Msg("[PERK] 注册表扫描: 共 " + scanned + " 条，真实类名=PerkGroup 的 " + matched
                         + " 个，建出名字索引 " + byName.Count + " 个");
-        foreach (var kv in byName.Take(20))
+        foreach (var kv in byName)
             MelonLogger.Msg("[PERK]   组名索引: \"" + kv.Key + "\"");
 
         int req = 0, hit = 0, added = 0, miss = 0, err = 0;
@@ -506,7 +516,7 @@ public static class LoadPatchMain
                         + " 找不到组=" + miss + " 异常=" + err);
 
         // 回读：挂载后每个组的 PerksList 长度
-        foreach (var kv in byName.Take(12))
+        foreach (var kv in byName)
             try { MelonLogger.Msg("[PERK]   回读 组=\"" + kv.Key + "\" PerksList=" + (kv.Value.PerksList?.Length ?? -1)); }
             catch (Exception e) { MelonLogger.Warning("[PERK]   回读失败 " + kv.Key + ": " + e.Message); }
     }

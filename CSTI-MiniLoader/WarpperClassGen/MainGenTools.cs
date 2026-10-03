@@ -37,7 +37,18 @@ public static class MainGenTools
         if (!valueTuples.TryGetValue(fld, out var tuple)) return null;
         if (tuple.isValueType)
         {
-            // [FIX] 内联值类型字段（IL2CPP struct）不能按指针解引用读取，直接跳过（原实现用 IntPtr 读 8 字节，值无意义）
+            // #1 [掩盖审计] 不再返回 null：**读是安全的** → 用生成的托管属性读。
+            try
+            {
+                var prop = baseObj.GetType().GetProperty(fld);
+                if (prop != null && prop.CanRead) return prop.GetValue(baseObj);
+                Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|读值类型无可读属性", "该字段读不到（不是 null 语义）");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[GEN] 读值类型字段失败: " + baseObj.GetType().Name + "." + fld + " : " + e.GetType().Name + " " + e.Message);
+            }
+
             return null;
         }
 
@@ -84,7 +95,72 @@ public static class MainGenTools
         if (!valueTuples.TryGetValue(fld, out var tuple)) return;
         if (tuple.isValueType)
         {
-            // [FIX] 内联值类型字段：不做写回（原实现把裸 IntPtr 写回去，等于破坏该 struct）
+            // #2/#3 [掩盖审计] 值类型字段的**通用写入通道**（零裸内存、零静默）：
+            //   ① data 是 JSON → 代理 → warp → 属性 setter 整块写回；
+            //   ② data 是**运行时对象**（模板克隆/深拷贝/嵌套对象挂载都会这样传）→
+            //      **源对象属性 getter 读 → 目标对象属性 setter 写**（同名字段按值拷贝）。
+            //      真机实测：这条路径缺失导致 14,000 条"[GEN] 值类型字段无法写回（数据不是 JSON）"
+            //      —— `LocalizedString`（ActionDescription/CustomDestroyMessage/LogText/VictoryMessage…）
+            //      这一整类内联结构字段**从来没被拷过去**，是"动作字段看着有、实际空"的另一半原因。
+            if (data is KVProvider kvp)
+            {
+                if (!Diag.TrySetStructViaProxy(baseObj, fld, kvp))
+                    Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|JSON 写回失败",
+                        "无可写属性 setter，该结构字段未被赋值");
+            }
+            else if (data != null)
+            {
+                // ★★ [2026-10-03 第 10 轮 · 修"源→目标"分支的**语义错位**]
+                //   这条分支有两种调用形态：
+                //     ① **值的直接写回**（`DeepDetach`/`DetachPlainClassChildren` 的去共享新实例；
+                //        以及"嵌套值类型子对象 warp 完写回"）—— data 就是"要写进目标字段的那个对象"；
+                //     ② **同类型整对象拷贝**（模板克隆）—— 需要"源同名成员 get → 目标同名成员 set"。
+                //   旧代码只实现了 ②，而且用 `src.GetType().GetProperty(fld)` 去**源对象上找目标字段名**
+                //   （例如 `LocalizedString.CardName`）→ 必然为 null ⇒ 真机 68 类 / 4 万+ 次失败，
+                //   且**数据根本没写回**（去共享的子对象仍与原对象共享 = 潜在的跨卡污染）。
+                //   现在：先按类型匹配**直接写回**（①），类型不匹配再回退 ②。TryWriteMember 会做
+                //   可赋值性检查，不匹配时**什么都不写**，所以两条语义不会互相污染。
+                var ok = false;
+                if (Diag.TryWriteMember(baseObj, fld, data))
+                {
+                    Diag.MemberDirectWrites++;
+                    ok = true;
+                }
+                else if (data is Il2CppObjectBase src)
+                {
+                    try
+                    {
+                        var pt = baseObj.GetType().GetProperty(fld);
+                        var ps = src.GetType().GetProperty(fld);
+                        if (pt != null && pt.CanWrite && ps != null && ps.CanRead)
+                        {
+                            pt.SetValue(baseObj, ps.GetValue(src));
+                            Diag.StructProxyWrites++;
+                            ok = true;
+                        }
+                    }
+                    catch (Exception __e)
+                    {
+                        Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|源→目标拷贝异常",
+                            __e.GetType().Name + " " + __e.Message);
+                        ok = true;   // 已上报，不再重复计数
+                    }
+
+                    if (!ok)
+                        Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|无可用成员(源→目标)",
+                            "源类型=" + src.GetType().Name + " 目标类型=" + baseObj.GetType().Name);
+                }
+                else
+                {
+                    Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|数据类型不支持",
+                        "data=" + data.GetType().Name);
+                }
+            }
+            else
+            {
+                Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|数据类型不支持", "data=null");
+            }
+
             return;
         }
 
@@ -136,9 +212,7 @@ public static class MainGenTools
                 return true;
             }
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
         try
         {
@@ -154,9 +228,7 @@ public static class MainGenTools
                 }
             }
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
         if (trace) MelonLogger.Msg("[RESOLVE] " + typeof(T).Name + " id=" + id + " → 未解析 ✗");
         return false;
@@ -173,8 +245,9 @@ public static class MainGenTools
         try
         {
             var o = Diag.NameIndexFind(typeof(T).Name, name);
-            if (o == null && typeof(T).BaseType != null)
-                o = Diag.NameIndexFind(typeof(T).BaseType.Name, name);   // 子类名对不上时退到基类名
+            // [形态分派审计] 不再退到基类名（同属兜底掩盖）
+            // ★ [形态分派审计] 删除"全桶按名找"（NameIndexFindAny）：它把"类型不匹配"掩盖成"碰巧找到"。
+            //   现在只查该字段声明类型自己的名字索引；查不到就是查不到，并把索引规模打出来。
             if (o == null)
             {
                 Diag.CountNameHit(false);
@@ -190,9 +263,7 @@ public static class MainGenTools
                 return true;
             }
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
         return false;
     }
@@ -218,9 +289,7 @@ public static class MainGenTools
                 isList = gtd == typeof(List<>);
             }
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
         if (MiniLoader.DiagFull && SetTrace < 40)
         {
@@ -278,8 +347,7 @@ public static class MainGenTools
     public static void SetByWarpper<T>(Il2CppObjectBase baseObj, string fld, KVProvider warpData, WarpType warpType)
         where T : Il2CppObjectBase
     {
-        if (TryResolveRef<T>(warpData.ToString(), out var item) ||
-            TryResolveRefByName<T>(warpData.ToString(), out item))   // C：GUID 失败后按「类型+名字」再试
+        if (Diag.ResolveByJsonForm<T>(warpData.ToString(), fld, out var item))   // ★ 按 JSON 形态分派（禁止互相兜底）
         {
             var objHandle = IL2CPP.Il2CppObjectBaseToPtrNotNull(baseObj);
             // [FIX] 字段偏移必须按「字段宿主」的类型查，不能用元素类型 T 查（原来用 typeof(T) 永远查不到）
@@ -287,10 +355,12 @@ public static class MainGenTools
             if (!valueTuples.TryGetValue(fld, out var tuple)) return;
             if (tuple.isValueType)
             {
-                unsafe
-                {
-                    *(T*)(objHandle + tuple.fOffset) = item;
-                }
+                // #3 [2026-10-03 掩盖审计] **删除裸指针写** `*(T*)(base+offset)=item`：
+                // 对含引用的内联结构写 8 字节指针会破坏内存，而且它掩盖了"结构字段没有安全写路径"。
+                // 统一走通解：代理 → warp → 属性 setter 整块写回；失败**打日志**（零静默）。
+                if (!Diag.TrySetStructViaProxy(baseObj, fld, warpData))
+                    MelonLogger.Warning("[GEN] SetByWarpper 值类型字段写回失败（无可用属性 setter）: "
+                                        + baseObj.GetType().Name + "." + fld);
             }
             else
             {
@@ -313,19 +383,13 @@ public static class MainGenTools
                 var li = *(IntPtr*)(objHandle + tuple.fOffset);
 
                 // ★ 同数组守卫：只解引用阶段不许重建**非空** List（保住反序列化带进来的原引用）
-                if (WarpFunc.WarpKeysOnly && li != IntPtr.Zero && new List<T>(li).Count > 0)
-                {
-                    KeysOnlyGuardSkips++;
-                    return;
-                }
 
                 var list = li != IntPtr.Zero ? new List<T>(li) : new List<T>();
                 // [2026-10-03] 不再整表清空：MODIFY 也改成"就地改同下标、余额追加"，避免把原元素换掉。
                 var liOriginal = list.Count;
                 for (var i = 0; i < warpData.Count; i++)
                 {
-                    if (TryResolveRef<T>(warpData[i].ToString(), out var item) ||
-                        TryResolveRefByName<T>(warpData[i].ToString(), out item))
+                    if (Diag.ResolveByJsonForm<T>(warpData[i].ToString(), fld, out var item))   // ★ 按 JSON 形态分派
                     {
                         list.Add(item);
                     }
@@ -356,11 +420,6 @@ public static class MainGenTools
             var li = *(IntPtr*)(objHandle + tuple.fOffset);
 
             // ★ 同数组守卫：只解引用阶段不许重建**非空** List（保住反序列化带进来的原引用）
-            if (WarpFunc.WarpKeysOnly && li != IntPtr.Zero && new List<T>(li).Count > 0)
-            {
-                KeysOnlyGuardSkips++;
-                return;
-            }
 
             var list = li != IntPtr.Zero ? new List<T>(li) : new List<T>();
 
@@ -403,13 +462,14 @@ public static class MainGenTools
 
                     Diag.CurrentPhase = "新建元素追加(List)";
                     Diag.DeserializeElement((Il2CppObjectBase)(object)created, el, "List追加");
-                    WarpFunc.JsonWarpKeysOnly(created, el);   // 只解 *WarpData 引用，别重建已填好的容器
+                    WarpFunc.JsonCommonWarpper(created, el);   // P1：精确语义，无需守卫
+                    Diag.DumpTriggerFields(created, el, baseObj.GetType().Name + "." + fld + "[" + i + "]（List追加）");
                     list.Add(created);
                     appended++;
                 }
             }
 
-            if (LiNoWarpperLogged < 12)
+            if (inPlace > 0 || appended > 0)   // 只打"确实动过"的；无数量上限（零 cap、零静默）
             {
                 LiNoWarpperLogged++;
                 MelonLogger.Msg("[ARR] 对象元素列表(NoWarpper): " + baseObj.GetType().Name + "." + fld
@@ -449,11 +509,6 @@ public static class MainGenTools
 
                 // ★ 同 SetArrNoWarpper 的守卫：只解引用阶段不许重建**非空**容器
                 //   （反序列化已把那批元素连同原引用填好；重建 = 丢引用）。
-                if (WarpFunc.WarpKeysOnly && arr != IntPtr.Zero && IL2CPP.il2cpp_array_length(arr) > 0)
-                {
-                    KeysOnlyGuardSkips++;
-                    return;
-                }
 
                 Trace("[ARR] 旧数组=0x" + arr.ToInt64().ToString("X"));
 
@@ -533,7 +588,8 @@ public static class MainGenTools
                                 }
                             }
 
-                            WarpFunc.JsonWarpKeysOnly(createdT, el);   // 只解引用（同上）
+                            WarpFunc.JsonCommonWarpper(createdT, el);   // P1：精确 ADD 语义已保证原元素不动，无需"只解引用"守卫
+                    Diag.DumpTriggerFields(createdT, el, baseObj.GetType().Name + "." + fld + "[" + i + "]");
                             cacheTLi.Add(createdT);
                             CreatedByWarp++;
                             appendedNew++;
@@ -550,8 +606,7 @@ public static class MainGenTools
                         continue;
                     }
 
-                    if (TryResolveRef<T>(el.ToString(), out var item) ||
-                        TryResolveRefByName<T>(el.ToString(), out item))
+                    if (Diag.ResolveByJsonForm<T>(el.ToString(), fld, out var item))   // ★ 按 JSON 形态分派
                     {
                         // ★ [2026-10-03 第 4 轮] MODIFY 下**绝不替换原引用**（真机实测有 2 个原元素被换掉 ✗）：
                         // 字符串形式只给了"已存在对象的引用"，没有字段可写 → **保留原元素**并记日志。
@@ -583,9 +638,7 @@ public static class MainGenTools
                             IL2CPP.Il2CppObjectBaseToPtr(cacheTLi[i]) == IL2CPP.Il2CppObjectBaseToPtr(existingArr[i]))
                             preserved++;
                     }
-                    catch
-                    {
-                    }
+                    catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                 }
 
                 if (originalCount > 0)
@@ -649,15 +702,8 @@ public static class MainGenTools
 
             // ★★ [2026-10-03 第 7 轮 · 最后一处] 守卫**下沉到函数内部**：
             //    生成包装器/反射调用（栈里是 `RuntimeMethodInfo.InternalInvoke` → 本函数）会**绕过**
-            //    `JsonCommonWarpper` 主循环里的 `WarpKeysOnly` 守卫，于是在"只解引用"阶段又把反序列化
             //    已填好的**非空容器**按 ADD 重建 → 原元素引用丢失（真机 7 处：CardDropChanceModifiers /
-            //    TimeOfDayMods / NOTAffectedThings）。规则：`WarpKeysOnly` 为真时**只允许"空容器被填"，
             //    绝不允许"非空容器被重建"**。
-            if (WarpFunc.WarpKeysOnly && arr != IntPtr.Zero && IL2CPP.il2cpp_array_length(arr) > 0)
-            {
-                KeysOnlyGuardSkips++;
-                return;
-            }
 
             // ★★ [2026-10-03] 这里才是 GSM「对象元素数组」真正走的路（CommonSet 对 `warpData[0].IsObject`
             //    分派到 SetArrNoWarpper，而不是 SetArrByWarpper）—— 之前两轮修错了地方。
@@ -718,14 +764,14 @@ public static class MainGenTools
                     Diag.CurrentPhase = "新建元素追加(Array)";
                     Diag.DeserializeElement(created, el, "追加");
                     // ② 再**只解引用**（`*WarpData`），不再碰已由反序列化填好的普通容器 → 保住原始引用
-                    WarpFunc.JsonWarpKeysOnly(created, el);
+                    WarpFunc.JsonCommonWarpper(created, el);
+                    Diag.DumpTriggerFields(created, el, baseObj.GetType().Name + "." + fld + "[" + i + "]（NoWarpper追加）");
                     cacheTLi.Add(created);
                     appended++;
                 }
                 else
                 {
-                    if (TryResolveRef<T>(el.ToString(), out var item) ||
-                        TryResolveRefByName<T>(el.ToString(), out item))
+                    if (Diag.ResolveByJsonForm<T>(el.ToString(), fld, out var item))   // ★ 按 JSON 形态分派
                         cacheTLi.Add(item);
                 }
             }
@@ -768,7 +814,7 @@ public static class MainGenTools
                 }
             }
 
-            if (NoWarpperLogged < 12)
+            if (inPlace > 0 || appended > 0)   // 只打"确实动过"的；无数量上限（零 cap、零静默）
             {
                 NoWarpperLogged++;
                 MelonLogger.Msg("[ARR] 对象元素数组(NoWarpper): " + baseObj.GetType().Name + "." + fld
@@ -792,9 +838,8 @@ public static class MainGenTools
     public static int NoWarpperLogged;
     /// <summary>MODIFY 时"拒绝替换原引用"的次数（0 = 原元素一个都没被换掉）。</summary>
     public static int RefReplaceRefused;
-    public static int LiNoWarpperLogged;
+    public static int LiNoWarpperLogged;   // 保留字段：旧计数不再用于限制
 
     /// <summary>"只解引用"阶段被守卫拦下的"非空容器重建"次数（预期 >0；拦下 = 原引用保住）。</summary>
-    public static int KeysOnlyGuardSkips;
     private static int RefReplaceLogged;
 }

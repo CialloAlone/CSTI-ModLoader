@@ -75,9 +75,7 @@ public static class LoadArchMod
         {
             File.AppendAllText(ProbeLogPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\n");
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[LoadArchMod] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
     }
 
     /// <summary>
@@ -246,7 +244,7 @@ public static class LoadArchMod
                 foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
                 {
                     Type k = null;
-                    try { k = a.GetType("CstiICallFix.RealShims"); } catch { }
+                    try { k = a.GetType("CstiICallFix.RealShims"); } catch (Exception __e) { MelonLogger.Warning("[LoadArchMod] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                     if (k == null) continue;
                     var m = k.GetMethod("CreateLike",
                         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
@@ -769,6 +767,7 @@ public static class LoadArchMod
                             }
                         }
 
+                        try { Diag.ModCardJsonSource[card_guid] = mapperObject; } catch (Exception __e) { MelonLogger.Warning("[LoadArchMod] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // 诊断：留下作者 JSON 供对账
                         if (!WaitForWarpperEditorGuidDict.ContainsKey(card_guid))
                             WaitForWarpperEditorGuidDict.Add(card_guid,
                                 new ScriptableObjectPack(card, "", "", modName,
@@ -800,6 +799,12 @@ public static class LoadArchMod
                 var LocalName = binaryReader.ReadString();
                 if (LocalName == EndFlg) break;
                 var LocalContent = binaryReader.ReadString();
+
+                // [2026-10-03 通用化] 记录"**来自 mod 包**的本地化键"（按来源，不按名字）——
+                // 供 [L10N] 判据统计"注入键数 / 其中有几条真的进了 LocalizationManager"，
+                // 对任何 mod 都成立，不需要知道 mod 叫什么。
+                Diag.NoteModLocalizationKey(LocalName);
+
                 WaitForLoadCSVList.Add((LocalName, LocalContent));
             }
         }

@@ -47,7 +47,7 @@ namespace CSTI_MiniLoader
                     if (d == null || d.Count == 0) continue;
                     if (MiniLoader.DiagFull)
                     {
-                        var sample = d.Keys.Take(6).ToList();
+                        var sample = d.Keys.ToList();   // 无上限：抽样改为全量（零静默）
                         MelonLogger.Msg("[自检]   " + k.Name + " 抽样: " + string.Join(", ", sample));
                         if (k.Name == "Sprite" && d.Count > 0 && d.Count <= 200)
                             MelonLogger.Msg("[自检]   Sprite 全量键(" + d.Count + "): " + string.Join(", ", d.Keys));
@@ -60,12 +60,12 @@ namespace CSTI_MiniLoader
                         var reg = UniqueIDScriptable.AllUniqueObjects;
                         if (reg != null) foreach (var id in d.Keys) { if (id != null && reg.ContainsKey(id)) inGame++; }
                     }
-                    catch { }
+                    catch (Exception __e) { MelonLogger.Warning("[SelfCheck] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                     MelonLogger.Msg("[自检]   " + k.Name + " 已进入游戏注册表 " + inGame + " / " + d.Count);
                 }
 
                 int after = -1;
-                try { after = UniqueIDScriptable.AllUniqueObjects?.Count ?? -1; } catch { }
+                try { after = UniqueIDScriptable.AllUniqueObjects?.Count ?? -1; } catch (Exception __e) { MelonLogger.Warning("[SelfCheck] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                 MelonLogger.Msg("[自检] 游戏注册表: mod 加载前 " + _registryBefore + " → 现在 " + after
                                 + "（增量 " + ((_registryBefore >= 0 && after >= 0) ? (after - _registryBefore).ToString() : "?") + "）");
                 MelonLogger.Msg("===== [自检] 结束 =====");

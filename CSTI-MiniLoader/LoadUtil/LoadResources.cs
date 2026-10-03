@@ -166,8 +166,8 @@ public static class LoadResources
                 if (loggedTypes.Add(tname))
                 {
                     var genFields = -1;
-                    try { genFields = MainGen.GetOrGen(processingScriptableObjectPack.Obj.GetType()).Count; } catch { }
-                    var sampleKeys = string.Join(",", json.Keys.Take(6));
+                    try { genFields = MainGen.GetOrGen(processingScriptableObjectPack.Obj.GetType()).Count; } catch (Exception __e) { MelonLogger.Warning("[LoadResources] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
+                    var sampleKeys = string.Join(",", json.Keys);
                     MelonLogger.Msg("[WARP] 首见类型 " + tname + " json字段=" + json.Count + " gen字段=" + genFields
                                     + " 例键=[" + sampleKeys + "] il2cpp类=" + tname);
                 }
@@ -266,7 +266,7 @@ public static class LoadResources
                         perkNoGroupKey++;
                         if (perkNoGroupKey <= 5)
                             MelonLogger.Warning("[PERK] 特质 JSON 里没有 CharacterPerkPerkGroup: " + Diag.NameOf(perk)
-                                                + " 键=[" + string.Join(",", json.Keys.Take(12)) + "]");
+                                                + " 键=[" + string.Join(",", json.Keys) + "]");
                     }
                 }
                 else if (processingScriptableObjectPack.Obj is GameStat stat)
@@ -425,9 +425,7 @@ public static class LoadResources
                 {
                     if (Diag.Retype(item.Obj) is ScriptableObject retypedObj) item.Obj = retypedObj;
                 }
-                catch
-                {
-                }
+                catch (Exception __e) { MelonLogger.Warning("[LoadResources] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
                 var processingScriptableObjectPack = item;
 
@@ -481,7 +479,7 @@ public static class LoadResources
                     if (gsmFieldNames != null)
                     {
                         try { Diag.LogGsmEntry(GsmSeen, GsmTotalExpected, item.Obj, item.CardDirOrGuid, json, gsmBefore); }
-                        catch { }
+                        catch (Exception __e) { MelonLogger.Warning("[LoadResources] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                     }
                 }
 

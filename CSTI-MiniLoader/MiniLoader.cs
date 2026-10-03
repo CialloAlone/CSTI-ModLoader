@@ -156,6 +156,11 @@ public class MiniLoader : MelonMod
             var gsmInline = cat.CreateEntry("GSM_InlineWrite", false,
                 "值类型字段是否走托管属性 setter 安全通道（默认关；直写内存已撤销，会崩）");
             GsmInlineWrite = gsmInline.Value;
+
+            var ssf = cat.CreateEntry("StructSetterFix", true,
+                "内联结构字段用托管代理+属性 setter 写回（纯托管，无裸内存）");
+            StructSetterFix = ssf.Value;
+
             var fillEntry = cat.CreateEntry("CheatListsTriggerFill", true,
                 "mod 卡不在控制台列表时调用游戏 FillCards() 重填一次");
             CheatListsTriggerFill = fillEntry.Value;
@@ -233,6 +238,16 @@ public class MiniLoader : MelonMod
     public static bool GsmInlineWrite;
 
     /// <summary>
+    /// 内联结构字段是否走"托管代理 + 属性 setter 写回"（`CSTI_MiniLoader/StructSetterFix`，默认 **true**）。
+    /// 纯托管：`prop.GetValue` → 在代理上 warp → `prop.SetValue` 整块写回；**无偏移、无 memcpy、无裸内存**。
+    /// 关掉即回到"内联结构一律跳过"的老行为。
+    /// </summary>
+    public static bool StructSetterFix = true;
+
+    /// 通用判据，不按 mod/卡名挑选）。</summary>
+
+
+    /// <summary>
     /// mod 卡不在控制台列表里时，是否调用游戏自己的 `CheatsManager.FillCards()` 重填一次（最多 3 次）。
     /// MelonPreferences：`CSTI_MiniLoader/CheatListsTriggerFill`（默认 true）。
     /// </summary>
@@ -267,9 +282,7 @@ public class MiniLoader : MelonMod
                 if (k == key) return s.Substring(eq + 1).Trim();
             }
         }
-        catch
-        {
-        }
+        catch (Exception __e) { MelonLogger.Warning("[MiniLoader] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
         return null;
     }
@@ -284,6 +297,16 @@ public class MiniLoader : MelonMod
         if (i != null && bool.TryParse(i, out var iv)) { GsmInlineWrite = iv; changed = true; }
         return changed;
     }
+    /// <summary>[BUILD] 特性标记：列出本轮全部关键改动，便于"运行的代码 = 我们改的代码"一眼核对。</summary>
+    public const string BuildFeatures =
+        "dedup+fieldapi+formdispatch+nostruct-oracle+nocap+events-driven"
+        + "+struct-member-fallback(prop→field)+managed-struct-warp(scalar)+commonSetFld-direct-write";
+
+    /// <summary>[BUILD] 编译期源码路径（`[CallerFilePath]` 由编译器写死进 DLL）。</summary>
+    private static string BuildSourcePath(
+        [System.Runtime.CompilerServices.CallerFilePath] string path = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0)
+        => path + ":" + line;
     private static bool _initDone;
 
     /// <summary>由 HookFree 在注册表就绪后调用一次。</summary>
@@ -318,6 +341,39 @@ public class MiniLoader : MelonMod
 
     public override void OnInitializeMelon()
     {
+        // ★ [BUILD] 构建身份行（**第一行**）—— 唯一可靠的"运行的代码 = 我们改的代码"证明：
+        //   源码路径用 `[CallerFilePath]`（编译期写死在 DLL 里 ✓），再加程序集文件时间（= 构建时间 ✓）。
+        //   以后一看到这行就知道设备上跑的是哪份源码、哪个 sha 的构建。
+        try
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            var loc = asm.Location;
+            var built = System.IO.File.Exists(loc) ? System.IO.File.GetLastWriteTime(loc).ToString("yyyy-MM-dd HH:mm:ss") : "?";
+            var ver = asm.GetName().Version?.ToString() ?? "?";
+            var sha = "?";
+            try
+            {
+                using var fs = System.IO.File.OpenRead(loc);
+                using var sha256 = System.Security.Cryptography.SHA256.Create();
+                sha = Convert.ToHexString(sha256.ComputeHash(fs))[..16];
+            }
+            catch (Exception __e)
+            {
+                MelonLogger.Warning("[BUILD] 计算自身 sha 失败: " + __e.Message);
+            }
+
+            MelonLogger.Msg("[BUILD] CSTI-MiniLoader 版本=" + ver
+                            + " 特性=" + BuildFeatures
+                            + " 源码路径=" + BuildSourcePath()
+                            + " 构建时间=" + built
+                            + " 自身sha前16=" + sha
+                            + " 程序集=" + loc);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[BUILD] 身份行打印失败: " + __e.GetType().Name + " " + __e.Message);
+        }
+
         LoadDiagLevel();
 
         if (SkipHarmonyPatchAll)

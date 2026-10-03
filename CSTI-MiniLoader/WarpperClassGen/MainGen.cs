@@ -1,4 +1,5 @@
 using System;
+using MelonLoader;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
@@ -79,9 +80,7 @@ public static class MainGen
                             break;
                         }
                     }
-                    catch
-                    {
-                    }
+                    catch (Exception __e) { MelonLogger.Warning("[MainGen] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
                 }
 
                 warpper[name] = (realType, fPtr, (int)IL2CPP.il2cpp_field_get_offset(fPtr), IsIl2CppValueType(fPtr));

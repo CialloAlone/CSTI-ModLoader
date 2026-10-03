@@ -36,12 +36,14 @@ namespace CSTI_MiniLoader
         private static int _lastA = -1;
         private static int _lastB = -1;
 
-        /// <summary>由 HookFree.Tick 每帧调用；内部节流（约 4 秒一次）。</summary>
+        /// <summary>
+        /// 由 HookFree.Tick **每帧**调用。[掩盖审计 P4] 事件驱动：不再"每 4 秒轮询 + 20 秒冷却"，
+        /// 而是每帧比对 `AllCards` 的长度/首元素 —— 游戏一重建该表，下一次 Tick 立刻补回。
+        /// </summary>
         public static void Tick()
         {
             if (!MiniLoader.MaintainCheatLists) return;
             _tick++;
-            if (_tick % 240 != 0) return;
             try
             {
                 RunOnce();
@@ -59,7 +61,7 @@ namespace CSTI_MiniLoader
             if (cm == null) return;
 
             object gm = null;
-            try { gm = GetMember(cm, "GM"); } catch { }
+            try { gm = GetMember(cm, "GM"); } catch (Exception __e) { MelonLogger.Warning("[CheatListFix] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
             var modNames = ModCardNames();
 
@@ -67,20 +69,15 @@ namespace CSTI_MiniLoader
             if (gm != null) Report("GameManager.AllCards", gm, modNames, ref _lastB);
 
             // ② mod 卡一张都没命中 → 让游戏自己重填一次（它内部会走游戏的卡库）
-            //    幂等 + 冷却：游戏在进档/开界面时可能重建该表，所以只要"命中=0"就再触发一次，
-            //    但最多每 20 秒一次，避免与游戏本身的重填互相打架。
+            //    [掩盖审计 P4] 事件驱动：命中=0 就补，**没有固定冷却** —— 游戏在进档/开界面重建该表后，
+            //    下一次 Tick（每帧）就会把 mod 卡补回去；不再用"等 20 秒"来掩盖"不知道它何时重建"。
             if (a == 0 && MiniLoader.CheatListsTriggerFill)
             {
-                var now = Environment.TickCount;
-                if (now - _lastFillMs >= 20000)
-                {
-                    _lastFillMs = now;
-                    _fillTries++;
-                    var ok = Invoke(cm, "FillCards");
-                    var after = Report("触发 FillCards 后 CheatsManager.AllCards", cm, modNames, ref _lastA, force: true);
-                    MelonLogger.Msg("[CHEATLIST] 触发 FillCards()（第 " + _fillTries + " 次）: 调用成功=" + ok
-                                    + "；mod 卡命中 " + a + " → " + after);
-                }
+                _fillTries++;
+                var ok = Invoke(cm, "FillCards");
+                var after = Report("触发 FillCards 后 CheatsManager.AllCards", cm, modNames, ref _lastA, force: true);
+                MelonLogger.Msg("[CHEATLIST] 命中=0 → 立刻补（第 " + _fillTries + " 次）: 调用成功=" + ok
+                                + "；mod 卡命中 " + a + " → " + after);
             }
         }
 
@@ -140,9 +137,7 @@ namespace CSTI_MiniLoader
                         if (!string.IsNullOrEmpty(nm)) set.Add(nm);
                     }
             }
-            catch
-            {
-            }
+            catch (Exception __e) { MelonLogger.Warning("[CheatListFix] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
             return set;
         }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
@@ -126,7 +126,7 @@ namespace CSTI_MiniLoader
         {
             foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
             {
-                try { if (a.GetType("CheatsManager") != null) return a; } catch { }
+                try { if (a.GetType("CheatsManager") != null) return a; } catch (Exception __e) { MelonLogger.Warning("[Pump] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             }
             return null;
         }

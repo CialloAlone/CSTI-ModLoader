@@ -604,6 +604,92 @@ ICallFix 不在（或其回归导致启动崩溃）时它返回 null，回退的
 
 ### 两条永久教训
 1. ⛔ **绝不按"基址 + 字段偏移"直写非托管内存**（见 §22）：真机启动期 SIGSEGV。值类型字段只能走托管属性 setter，
-   且默认关闭；加载期改造游戏对象的整段代码必须包 try/catch。
+   且默认关闭；加载期改造游戏对象的整条代码必须包 try/catch。
 2. ⚠ **"引用丢失"的判据不能只看托管索引器**：`existingArr[i]` 抛异常会被 `catch {}` 吞掉 → 计数变 0 →
    伪装成"引用被替换"。要么裸读槽位（与写回同一套偏移），要么把读取失败单独计数（`读取失败=`）后再下结论。
+
+---
+
+## 24. ★ `prop=null` ×95,180 的真根因与通解（2026-10-03 11:38 真机验收通过）
+
+> 结论先行：交接文档 §2 的计划（"用官方字段 API 现造 boxed 结构逐子字段写"）**方向对、但前提错了**。
+> 用 `System.Reflection.Metadata` 直接读**设备上真正加载的** `MelonLoader/Il2CppAssemblies/Assembly-CSharp.dll`
+> 之后，真因是：**Il2CppInterop 对 il2cpp 值类型有两种生成形态**，而我们的访问层只会用属性。
+
+### 24.1 实证：两种生成形态（离线证据，可复现）
+
+工具：`temp/metadump`（自写，`dotnet run -- <dll> <类型名> [@成员过滤]`，只读 System.Reflection.Metadata）。
+
+| il2cpp 值类型 | interop 里的形态 | 成员 |
+|---|---|---|
+| `LocalizedString`、`DurabilityConditions`、`CardInteractionTrigger`（**含引用**） | 基类 = `Il2CppSystem.ValueType` 的**类** | **属性**（可读可写） |
+| `DurabilitiesConditions`、`DurabilityWeightValue`、`EncounterVariable`、`EnemySkillModifier`、`EnemyWoundModifier`、`EnemyWoundBasedWeightModifier`、`LightSourceSettings`、`SimpleHitProbabilityModifier`（**blittable**） | 基类 = `System.ValueType` 的 **C# struct**（`ExplicitLayout`） | **public 字段，没有属性** |
+
+- 设备侧 `UnityEngine.CoreModule.dll` 里 `Vector2` = `public float x/y`（字段）、`Vector2Int` = `public int m_X/m_Y` + 属性 `x/y`、`Color` = `public float r/g/b/a`。
+- 宿主端（`ExtraDurabilityChange.RequiredDurabilities` / `GeneralCondition.RequiredDurabilityRanges` /
+  `AmbienceSettings.AmbienceConditions` / `EnemyAction.EnemySkillClashModifier` / `CardData.LightSource` /
+  `CardsDropCollection.DurabilitiesDropChanceModifier` / `PlayerEncounterVariable.AddedValue`）**都是可写属性**
+  → 外层 `prop.GetValue` 拿到的是**托管结构副本**，`prop.SetValue` 整块写回是有效的。
+
+### 24.2 因此 `prop=null` 是**误报**，真正缺的是两件事
+
+1. **成员访问只有属性一路** → blittable 结构（以及它们内部的 `Vector2/Color/…`）恒 `prop=null` → 95,180 行刷屏 + **这一类字段从来没写进去**。
+2. **主 warp 没有标量通道** → 这些结构的 JSON 键大量是标量（`{"SpecialNRange":{"x":0,"y":100}}`），
+   主循环只认 `*WarpData`/对象/容器 → 标量静默跳过 → 即使结构能拿到，叶子也永远是默认值。
+
+### 24.3 修法（三处，全部零偏移、零裸内存）
+
+| 位置 | 改动 |
+|---|---|
+| `Diag.cs` | 新增**托管成员访问层** `FindMember/TryReadMember/TryWriteMember`（**属性优先 → public 字段兜底**，带缓存、可赋值性检查、绝不隐式强转）；`TrySetStructViaProxy` 改用它，失败一律 `NoteInlineIssue` **去重计数**（★ 删掉原来逐条的 `MelonLogger.Warning`，30MB 日志的元凶） |
+| `WarpFunc.cs` | 新增 `ManagedStructWarp`：**不是 `Il2CppObjectBase` 的托管副本**（= boxed 结构）走"托管成员"通道，对象键递归、标量键精确转换（`Diag.TryConvertScalar`）；`StatLine` 增加 `托管结构写入=N(字段=… 属性=…)` |
+| `MainGenTools.cs` | `CommonSetFld` 的"源→目标"分支修正**语义错位**：`data` 类型与目标成员匹配时**直接写回**（去共享新实例 / 嵌套值类型子对象 warp 完写回），不匹配才回退旧的"同名成员读→写"。旧代码去源对象上找**目标字段名**（`LocalizedString.CardName`）→ 必然 null → 真机 68 类 / 4 万+ 次失败**且数据没写回** |
+
+**顺带修掉的一个真 bug**：`Diag.TryConvertScalar` 原来用 `v.String` 取标量文本，而 mod JSON 走的是
+`MapperItem`（modArch 二进制），其 `String` 对**非字符串恒为空串**（文本只在 `ToJson()` 里）→
+56 万次 `Vector2.x/y` 转换 FormatException。新增 `Diag.RawScalarText` 同时覆盖
+`JsonKVProvider`（LitJson）与 `MapperItem` 两种实现（首轮真机实测抓到的，见 §24.5 第 1 轮）。
+
+### 24.4 验收判据（真机 `Logs/26-10-3_11-38-8.log`，420 KB / 2,532 行）
+
+| 判据 | 交接文档要求 | 实测 | 旧代码 |
+|---|---|---|---|
+| `[BUILD]` 身份行 | 必须证明"跑的=改的" | `自身sha前16=60693F5804338CA7` = 本地产物 SHA256 前 16；构建时间 11:38:02；源码路径正确 | 旧轮 SHA 对得上但读错日志 |
+| `prop=null` | 归零 | **0** | 95,180 |
+| `[INL] 内联结构写回汇总` | 唯一问题很小 | `成功=429200 失败=0 唯一问题=0` | `失败=95180 唯一问题=68` |
+| `[INL]` 明细行 | 无/极少 | **0 行** | 68 行 × 数万次 |
+| 字段路径被真正用到 | `字段API > 0` | `托管结构写入=891675(字段=850907 属性=40768)` | 0（根本没有字段路径） |
+| 写回是否真进真对象 | — | `读回校验=292939 读回不一致=0`（真对象读回逐成员比对） | 无此判据 |
+| 语义错位分支 | — | `直接写回=38297` | 全部失败 |
+| 底线 | 不崩 / `[INVARIANT]` 0 变化 / `增量 206` / 加载成功 | 全部 ✔（两次对比 尺寸/内容/丢失=0；`增量 206`；`[STEP] 9 done 总耗时=98263ms`） | — |
+| `[MODCARD] 通用汇总` | 全空=0 | ✔ 28 卡 / 106 交互项 / 全空=0 | ✔ |
+| `[GSM] 有意修改汇总` | 成功=61 无变化=2 失败=0 | ✔ 完全一致 | ✔ |
+| 日志体积 | 回落到几百 KB | **420 KB**（−98.6%） | 30.9 MB |
+| `跳过(无字段)` | — | 12 | 562,023 |
+
+### 24.5 过程记录（两轮真机，含一次自身缺陷）
+
+1. **第一轮**（11:31，`Logs/26-10-3_11-31-15.log`）：`prop=null` 已归零、`失败=0`，但
+   `唯一问题=15` 全是 `Vector2.x|托管结构键未处理（标量类型不支持 目标类型=Single）` ×56 万
+   → 抓到上面那个 `MapperItem.String` 空串缺陷（**若不复跑就会把"叶子全是 0"当成成功**）。
+2. **第二轮**（11:38）：全绿，见 §24.4。
+3. 交接文档 §2 里"读错日志文件"的教训继续有效：**必须读 `MelonLoader/Logs/<最新>.log`**。
+
+### 24.6 与交接文档计划的差异（如实记录）
+
+- 计划要求"新增 `il2cpp_object_new`+`il2cpp_field_set_value` 逐子字段写"的**官方字段 API**助手。
+  实测证明**不需要**：这些结构在托管侧就是货真价实的 C# struct（`ExplicitLayout`），
+  在**托管副本**上按 public 字段写、再经 interop 属性 setter 整块写回，全程只碰托管内存，
+  比手写 boxed 结构 + 逐子字段 native 写**更安全**（避开 §22 那类崩溃风险），且已被 29 万次读回校验证明有效。
+- `CopyStructFieldViaFieldApi`（§3 已实现的 object→object 官方字段 API 拷贝）保留为回退通道，本轮未被触发
+  （`官方字段API=0`），计数保留在汇总行里可见。
+- 结论：**判据以"字段路径真的被用上 + 读回一致"为准**（`托管结构写入(字段=850907)` + `读回不一致=0`），
+  而不是"某个特定 API 被调用"。这一点写进文档，避免下次又按错误前提去补实现。
+
+### 24.7 用户级影响
+
+- 之前这一类字段（耐久区间 / 照明参数 / 敌人技能与创伤修正 / 命中概率修正 / 掉落权重区间 …
+  以及**任何 mod 卡 JSON 里出现的这些结构**）**从未被写入**；GSM 改造游戏对象时又没有 JsonUtility 兜底
+  → 这些值一直是默认值。本轮起按 JSON 真实写入，且**读回校验 0 不一致**。
+- 仍需用户复测的：拖拽交互（纤维/棕榈叶/泥堆 → 风精灵）。数据层判据已全绿
+  （`交互项=106，TriggerCards/TriggerTags 全空=0`），但**手感类结论只能由用户在游戏里给**。
