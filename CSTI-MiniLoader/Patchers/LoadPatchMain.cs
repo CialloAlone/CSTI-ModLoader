@@ -427,6 +427,7 @@ public static class LoadPatchMain
             Diag.DumpSkipKeys();   // [GSM] 跳过汇总：去重 + ×次数（零 cap、零刷屏）
             foreach (var rm in Diag.ResolveMisses) MelonLogger.Warning(rm);
             MelonLogger.Msg("[RESOLVE] 未解析汇总: " + Diag.ResolveMisses.Count + " 条（完整清单；0 = 所有引用都解析成功）");
+            try { PatchTest.Enumerate(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             try { PatchTest.Install(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             try { DragProbe.Install(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             Diag.DumpReadback();                 // [READBACK] 读回校验降级收益
