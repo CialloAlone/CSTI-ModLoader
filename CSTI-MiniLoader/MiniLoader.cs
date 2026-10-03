@@ -371,6 +371,7 @@ public class MiniLoader : MelonMod
         // ★★ [PATCH-TEST 时机修复] 探针安装必须**早于 ClearDict**（真机证据：安装 15:12:11 晚于 mod 加载完成 15:10:41
         //    ⇒ ClearDict 早已被调用过 ⇒ 只看到"已挂"、看不到"首次调用"）。挪到 OnInitializeMelon 最早期 ✓。
         //    两个开关都默认关（架构纯净 ✓），失败只告警、绝不抛。
+        CSTI_MiniLoader.Diag.PhaseMark("t0=melon init 开始");   // [PHASE-ORDER]
         try { CSTI_MiniLoader.PatchTest.Install(); } catch (Exception __pe) { MelonLogger.Warning("[PATCH-TEST] 早期安装异常: " + __pe.GetType().Name + " " + __pe.Message); }
         try { CSTI_MiniLoader.PatchTest.Enumerate(); } catch (Exception __pe2) { MelonLogger.Warning("[PATCH-TARGETS] 早期枚举异常: " + __pe2.GetType().Name + " " + __pe2.Message); }
         // ★ [BUILD] 构建身份行（**第一行**）—— 唯一可靠的"运行的代码 = 我们改的代码"证明：

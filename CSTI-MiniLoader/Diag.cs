@@ -5612,5 +5612,20 @@ public static class Diag
         }
     }
 
+    // ═══════════ ★ [PHASE-ORDER] 流水线时间线（毫秒；无 cap） ═══════════
+    private static readonly List<string> PhaseOrder = new();
+
+    /// <summary>`[PHASE-ORDER] <标记> t=…ms`（累计毫秒，便于判定"创建是否赶在 ClearDict 之前"）。</summary>
+    public static void PhaseMark(string tag)
+    {
+        try
+        {
+            var line = "[PHASE-ORDER] " + tag + " t=" + ElapsedMs + "ms";
+            PhaseOrder.Add(line);
+            MelonLogger.Msg(line);
+        }
+        catch { }
+    }
+
 }
 
