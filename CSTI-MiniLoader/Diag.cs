@@ -1675,6 +1675,8 @@ public static class Diag
     public static int NameIndexMissReplay;
     /// <summary>[RESOLVE-TRACE/PATH] 只读追踪计数（各只打前 5 次）。</summary>
     public static int ResolveTraceCount, ResolvePathCount;
+    /// <summary>[RESOLVE 兜底] 名字分支 miss 后"补登记+重试"的次数与成功数。</summary>
+    public static int ResolveFallbackCount, ResolveFallbackOk;
     /// <summary>[RESOLVE-PATH] 已标记过的桶（按桶去重，避免被次数上限挡住）。</summary>
     private static readonly HashSet<string> ResolvePathSeen = new();
     /// <summary>[NAMEIDX] 类型链级兜底（每级桶 miss 后补登记重试）的成功/尝试次数。</summary>
@@ -3621,6 +3623,24 @@ public static class Diag
         }
 
         if (WarpperClassGen.MainGenTools.TryResolveRefByName<T>(value, out item)) return true;
+
+        // ★★ [RESOLVE 兜底 · 2026-10-03 最后一次定点] 名字查找 miss → ReapplyNameRegistrations(该桶) 一次 → 重试同一查找。
+        //    实证：Cart 的 miss 由本行进入（TRACE 调用者=MainGenTools.SetArrByWarpper ← 反射 Invoke，解析点 MainGenTools.cs:660）。
+        //    幂等、只在 miss 时执行、命中路径零开销、不改任何写入行为。
+        try
+        {
+            ReapplyNameRegistrations(typeof(T).Name);
+            ResolveFallbackCount++;
+            if (WarpperClassGen.MainGenTools.TryResolveRefByName<T>(value, out item))
+            {
+                MelonLogger.Warning("[RESOLVE 兜底] 桶=" + typeof(T).Name + " 名字=" + value + " 字段=" + field + "（命中 ✓）");
+                return true;
+            }
+            if (ResolveFallbackCount <= 10)
+                MelonLogger.Warning("[RESOLVE 兜底] 桶=" + typeof(T).Name + " 名字=" + value + " 字段=" + field + "（仍未命中）");
+        }
+        catch { }
+
         AddResolveMiss(typeof(T).Name, value, "名字", field,
             "名字索引[" + typeof(T).Name + "]=" + NameIndexCount(typeof(T).Name) + " 项");
         return false;
