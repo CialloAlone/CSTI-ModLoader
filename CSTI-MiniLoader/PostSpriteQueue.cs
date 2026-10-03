@@ -75,12 +75,25 @@ namespace CSTI_MiniLoader
                     var (h, fld, v) = Q[i];
                     try
                     {
-                        if (!h.IsAlive || !v.IsAlive) { FailedFlush++; continue; }
+                        if (!h.IsAlive || !v.IsAlive)
+                        {
+                            FailedFlush++;
+                            MelonLogger.Warning("[POSTSPRITE] flush 失败(弱引用已死): 宿主存活=" + h.IsAlive
+                                                + " 值存活=" + v.IsAlive + " 字段=" + fld);   // ★ 逐条打全原因
+                            continue;
+                        }
+
+                        if (h.Target == null) { FailedFlush++; MelonLogger.Warning("[POSTSPRITE] flush 失败(宿主为 null): " + fld); continue; }
+                        if (v.Target == null) { FailedFlush++; MelonLogger.Warning("[POSTSPRITE] flush 失败(值为 null): " + fld); continue; }
+
                         if (Diag.TryWriteMember(h.Target, fld, v.Target)) Flushed++;
                         else
                         {
                             FailedFlush++;
-                            MelonLogger.Warning("[POSTSPRITE] flush 写回失败: " + h.Target.GetType().Name + "." + fld);
+                            var mt = Diag.MemberTypeOf(h.Target, fld);
+                            MelonLogger.Warning("[POSTSPRITE] flush 写回失败: " + h.Target.GetType().Name + "." + fld
+                                                + " 成员类型=" + (mt == null ? "找不到成员" : mt.Name)
+                                                + " 值类型=" + v.Target.GetType().Name);       // ★ 失败原因
                         }
                     }
                     catch (Exception e1)

@@ -436,6 +436,10 @@ public static class LoadPatchMain
             Diag.DumpWarpKeys();                 // [WARP-KEY] 键级汇总（处理/写入/跳过）
             Diag.DumpSetFldRejects();            // [SETFLD] 写入被拒汇总（去重计数）
             Diag.DumpInlineIssues();             // [INL] 条件筛选：成功计数 + 失败去重计数（不刷屏、不 cap）
+            // ★★ [POSTSPRITE 时机修复] flush 必须在**游戏读取卡面之前**同步跑一次（真机证据：
+            //    [CARDIMG] 快照 15:49:59 早于 Tick 泵 flush 15:50:22 ⇒ 队列值再没机会生效、图片全丢 ✗）。
+            //    PC 的 CompressOnLate 是 loader 自己阶段里的协程（早于游戏读取）；我们改为"warp/GSM 收尾同步 flush"。
+            try { PostSpriteQueue.Flush(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             Diag.DumpModCardImages();            // [CARDIMG] ★ 贴图回归判据：mod 卡面原生引用读数（null=红叉）
             try { DropsFix.RunAll("B:warp+GSM 之后"); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [DROPSFIX] 时机 B（PC: DoWarpperLoader.cs:82/146/210）
             try { PatchTest.Phase2Verify(true); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [PHASE2] 加载完成即验
