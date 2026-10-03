@@ -1787,6 +1787,8 @@ public static class Diag
     /// <summary>`[NAMEIDX]` 我们登记过的 mod 资产（桶,名字,对象）——索引是**惰性构建**的，构建后必须重放，
     /// 否则 mod 自建 sprite 会被"构建"覆盖掉（真机：DarthNihilus_Cart 图已登记但 warp 时查不到）。</summary>
     private static readonly List<(string Bucket, string Name, object Obj)> RegisteredNameQueue = new();
+    /// <summary>重放触发点标签（warp前 / 索引构建末尾），用于确认"这次真的触发了"。</summary>
+    public static string ReplayTrigger = "索引构建末尾";
 
     /// <summary>索引构建后重放我们的登记（bucket 为空 = 全部桶）；只读语义、幂等。</summary>
     public static void ReapplyNameRegistrations(string bucket)
@@ -1802,7 +1804,7 @@ public static class Diag
                 d[nm] = o;
                 n++;
             }
-            if (n > 0) MelonLogger.Msg("[NAMEIDX] 索引构建后重放 mod 登记=" + n + "（桶=" + (bucket ?? "全部") + "）");
+            if (n > 0) MelonLogger.Msg("[NAMEIDX] 重放 mod 登记=" + n + "（桶=" + (bucket ?? "全部") + "）触发点=" + ReplayTrigger);
         }
         catch (Exception e)
         {
@@ -1824,7 +1826,7 @@ public static class Diag
 
             if (d.ContainsKey(name)) return;   // 已存在（游戏资产优先）→ 不覆盖
             d[name] = obj;
-            try { if (!RegisteredNameQueue.Any(t => t.Bucket == bucket && t.Name == name)) RegisteredNameQueue.Add((bucket, name, obj)); } catch { }
+            try { if (!RegisteredNameQueue.Any(t => t.Bucket == bucket && t.Name == name)) { RegisteredNameQueue.Add((bucket, name, obj)); if (bucket == "Sprite") MelonLogger.Msg("[NAMEIDX] 已入队 mod sprite 名=" + name); } } catch { }
             NameIndexRegistered++;
             MelonLogger.Msg("[NAMEIDX] 注册(mod sprite): 名=" + name + " 桶=" + bucket
                             + " 累计=" + NameIndexRegistered);

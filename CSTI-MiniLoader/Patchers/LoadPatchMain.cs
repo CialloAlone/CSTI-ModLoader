@@ -374,7 +374,7 @@ public static class LoadPatchMain
             catch (Exception ie3) { MelonLogger.Warning("[INVARIANT] 对比失败: " + ie3.Message); }
             if (MiniLoader.DiagFull) try { Diag.DumpModPerkGroups(); Diag.DumpModPerksPostWarp(); }
             catch (Exception pge) { MelonLogger.Warning("[PG] 探针失败: " + pge.GetType().Name + " " + pge.Message); }
-            MelonLogger.Msg("[STEP] 5 WarpperAllEditorGameSrouces");
+            Diag.ReplayTrigger = "warp前";
             // ★ GSM 整段包 try/catch：任一条目异常只记日志继续，绝不让加载期异常掀翻整个进程
             if (MiniLoader.GsmApply)
             {
