@@ -1673,6 +1673,8 @@ public static class Diag
     public static int NameIndexRegistered;
     /// <summary>[NAMEIDX] 查找 miss 触发"补登记后重查"的次数（幂等兜底；实证：Cart 在 warp 时被重建吃掉登记）。</summary>
     public static int NameIndexMissReplay;
+    /// <summary>[RESOLVE-TRACE/PATH] 只读追踪计数（各只打前 5 次）。</summary>
+    public static int ResolveTraceCount, ResolvePathCount;
     /// <summary>[NAMEIDX] 类型链级兜底（每级桶 miss 后补登记重试）的成功/尝试次数。</summary>
     public static int NameIndexChainReplay, NameIndexChainReplayOk;
 
@@ -2850,6 +2852,27 @@ public static class Diag
     public static void AddResolveMiss(string typeName, string id, string form = "?", string field = "?",
         string indexes = "?")
     {
+        // ★★ [RESOLVE-TRACE · 只读] 一次性 caller 栈：点名"真正在查表"的函数（前 5 次，无按名分支）。
+        try
+        {
+            if (ResolveTraceCount < 5)
+            {
+                ResolveTraceCount++;
+                var st = new System.Diagnostics.StackTrace(true);
+                var frames = new List<string>();
+                for (var fi = 1; fi < st.FrameCount && frames.Count < 3; fi++)
+                {
+                    var m = st.GetFrame(fi)?.GetMethod();
+                    if (m == null) continue;
+                    var dt = m.DeclaringType?.FullName ?? "?";
+                    if (dt.Contains("Harmony") || dt.Contains("CSTI_MiniLoader") || dt.Contains("Il2CppInterop")) continue;
+                    frames.Add(dt + "." + m.Name);
+                }
+                MelonLogger.Warning("[RESOLVE-TRACE] 值=" + id + " 目标类型=" + typeName
+                                    + " 调用者=" + (frames.Count == 0 ? "(只有 interop/Harmony 帧)" : string.Join(" ← ", frames)));
+            }
+        }
+        catch { }
         try
         {
             // [形态分派审计] 措辞修正：不再把所有值都印成"GUID="（那会把名字也印成 GUID，误导定位）。
@@ -3582,6 +3605,8 @@ public static class Diag
     public static bool ResolveByJsonForm<T>(string value, string field, out T item)
         where T : Il2CppObjectBase
     {
+        // ★★ [RESOLVE-PATH · 只读] 标记本入口被走到（前 5 次）——用于点名真正处理 Cart 的路径。
+        try { if (ResolvePathCount < 5) { ResolvePathCount++; MelonLogger.Warning("[RESOLVE-PATH] 入口=ResolveByJsonForm<" + typeof(T).Name + ">（本入口被走到 ✓）"); } } catch { }
         item = null;
         if (string.IsNullOrEmpty(value)) return false;
         if (LooksLikeGuid(value))
