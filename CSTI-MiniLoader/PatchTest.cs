@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using HarmonyLib;
 using MelonLoader;
+using MelonLoader.Utils;
 
 namespace CSTI_MiniLoader
 {
@@ -46,9 +47,42 @@ namespace CSTI_MiniLoader
             "Awake", "Start", "Init", "Load", "Setup", "BeginBefore", "Clear", "Refresh", "Compress", "PostSet"
         };
 
+        /// <summary>读配置：先用 MiniLoader 的文件原文读取（PrefFileRaw）；若早期它还没就绪
+        /// （真机证据：15:13:40 早期安装读到"未开"、15:15:32 晚期安装才读到），则直接按约定路径读 cfg。
+        /// 只读、失败只告警、不依赖 MelonPreferences 是否已初始化。</summary>
         private static string Flag(string key)
         {
-            try { return (MiniLoader.PrefFileRaw(key) ?? "").ToLower(); } catch { return ""; }
+            try
+            {
+                var v = (MiniLoader.PrefFileRaw(key) ?? "").ToLower();
+                if (v.Length > 0) return v;
+            }
+            catch { }
+
+            try
+            {
+                var dir = MelonLoader.Utils.MelonEnvironment.UserDataDirectory;
+                var fp = System.IO.Path.Combine(dir, "MelonPreferences.cfg");
+                if (System.IO.File.Exists(fp))
+                {
+                    foreach (var line in System.IO.File.ReadAllLines(fp))
+                    {
+                        var s2 = line.Trim();
+                        if (s2.StartsWith(key, StringComparison.OrdinalIgnoreCase) && s2.IndexOf("=", StringComparison.Ordinal) >= 0)
+                            return s2.Substring(s2.IndexOf("=", StringComparison.Ordinal) + 1).Trim().Trim((char)34).ToLower();
+                    }
+                }
+                else
+                {
+                    MelonLogger.Warning("[PATCH-TEST] 早期读 cfg：文件不存在 " + fp);
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[PATCH-TEST] 早期读 cfg 失败: " + e.GetType().Name + " " + e.Message);
+            }
+
+            return "";
         }
 
         // ═══════════ ① 只读枚举（Diag_PatchTargets=true 时执行；零 Hook） ═══════════
@@ -183,6 +217,7 @@ namespace CSTI_MiniLoader
                 if (_h != null) return;   // 已挂过 → 不重复挂（幂等 ✓）
                 }
 
+                if (_h != null) return;   // 幂等 guard：已挂过就不再 patch（避免晚期再挂一次）
                 var t = Diag.FindTypeByName(TargetType);
                 if (t == null)
                 {
@@ -234,7 +269,89 @@ namespace CSTI_MiniLoader
                         MelonLogger.Warning("[PATCH-TEST] AllData.Count 读取失败: " + e2.GetType().Name + " " + e2.Message);
                     }
             }
+
             catch { }
         }
     }
+        // ═══════════ ★ Phase 2：append 进 AllData + 只读验证"游戏是否自己 Init()" ═══════════
+        public static int Appended, AppendedSkipped;
+        private static bool _appended;
+        private static long _appendedAt;
+        private static bool _verified;
+
+        /// <summary>照 PC 原样：把 mod 对象 append 进 GameLoad.Instance.DataBase.AllData（幂等，只做一次）。</summary>
+        private static void Phase2Append()
+        {
+            try
+            {
+                if (_appended) return;
+                _appended = true;
+                _appendedAt = Environment.TickCount64;
+                var allData = GameLoad.Instance.DataBase.AllData;
+                var dict = MiniLoader.ItemDictionary(typeof(CardData));
+                foreach (var kv in dict)
+                {
+                    try
+                    {
+                        var o = kv.Value;
+                        if (o == null) { AppendedSkipped++; continue; }
+                        if (Diag.ElemCount(allData) >= 0 && Contains(allData, o)) { AppendedSkipped++; continue; }
+                        allData.Add((UniqueIDScriptable)o);
+                        Appended++;
+                    }
+                    catch (Exception e1) { AppendedSkipped++; MelonLogger.Warning("[PHASE2] append 失败: " + e1.GetType().Name + " " + e1.Message); }
+                }
+                MelonLogger.Warning("[PHASE2] 已 append 进 AllData: 成功=" + Appended + " 跳过=" + AppendedSkipped
+                                    + " 之后 AllData.Count=" + Diag.ElemCount(allData));
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[PHASE2] append 阶段异常: " + e.GetType().Name + " " + e.Message);
+            }
+        }
+
+        private static bool Contains(object list, object item)
+        {
+            try
+            {
+                var n = (int)Diag.ElemCount(list);
+                for (var i = 0; i < n; i++)
+                    if (ReferenceEquals(Diag.GetElem(list, i), item)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>[Phase 2 · 步骤 3] 只读验证：游戏是否在 ClearDict 之后自己遍历 AllData 调了 Init()。
+        /// 判据：mod 对象的 UniqueID / LoadedId 是否变成非空（+ 掉落表是否被填充）。</summary>
+        public static void Phase2Verify()
+        {
+            try
+            {
+                if (!_appended || _verified) return;
+                if (Environment.TickCount64 - _appendedAt < 60000) return;   // 等 60 秒再验（给游戏自己的循环时间）
+                _verified = true;
+                var dict = MiniLoader.ItemDictionary(typeof(CardData));
+                int n = 0, idOk = 0, droppedOk = 0;
+                foreach (var kv in dict)
+                {
+                    n++;
+                    var o = Diag.Retype(kv.Value) ?? kv.Value;
+                    var id = Diag.Member(o, "UniqueID")?.ToString();
+                    if (!string.IsNullOrEmpty(id)) idOk++;
+                    var dl = Diag.Member(o, "AllDrops");
+                    if (dl != null && (int)Diag.ElemCount(dl) > 0) droppedOk++;
+                    if (n <= 3)
+                        MelonLogger.Warning("[PHASE2] 验证样本: " + (Diag.NameOf(o) ?? kv.Key) + " UniqueID=" + (id ?? "null")
+                                            + " AllDrops=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()));
+                }
+                MelonLogger.Warning("[PHASE2] 游戏自己 Init() 的验证: mod 卡=" + n + " UniqueID 非空=" + idOk
+                                    + " AllDrops 非空=" + droppedOk
+                                    + (idOk > 0 ? "  ⇒ **游戏确实遍历并 Init 了 ✓**" : "  ⇒ **未被 Init ✗**"));
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[PHASE2] 验证异常: " + e.GetType().Name + " " + e.Message);
+            }
+        }
 }
