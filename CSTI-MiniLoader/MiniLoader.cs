@@ -161,6 +161,18 @@ public class MiniLoader : MelonMod
                 "内联结构字段用托管代理+属性 setter 写回（纯托管，无裸内存）");
             StructSetterFix = ssf.Value;
 
+            // ★ [2026-10-03 回归二分开关] 第 10 轮"内联结构通解"的三处改动分别可关，
+            //   用于"回退到旧行为"做 A/B（不需要重新构建）：
+            //     · StructMemberFix   = 托管成员访问（属性→public 字段）+ boxed 结构托管通道
+            //     · SetFldDirectWrite = CommonSetFld 的"直接写回"分支
+            var smf = cat.CreateEntry("StructMemberFix", true,
+                "内联结构：属性→public字段回退 + boxed结构托管成员通道（关掉=回到第 9 轮行为）");
+            StructMemberFix = smf.Value;
+
+            var sdw = cat.CreateEntry("SetFldDirectWrite", true,
+                "CommonSetFld：data 类型匹配时直接写回目标字段（关掉=回到第 9 轮的\"同名成员拷贝\"）");
+            SetFldDirectWrite = sdw.Value;
+
             var fillEntry = cat.CreateEntry("CheatListsTriggerFill", true,
                 "mod 卡不在控制台列表时调用游戏 FillCards() 重填一次");
             CheatListsTriggerFill = fillEntry.Value;
@@ -243,6 +255,21 @@ public class MiniLoader : MelonMod
     /// 关掉即回到"内联结构一律跳过"的老行为。
     /// </summary>
     public static bool StructSetterFix = true;
+
+    /// <summary>
+    /// ★ [2026-10-03 回归二分开关] 第 10 轮"内联结构通解"的第一处改动：
+    /// 托管成员访问（属性优先 → public 字段兜底）+ boxed 结构的托管成员通道（含标量）。
+    /// **关掉即回到第 9 轮行为**（blittable 结构的字段一律跳过），用于定位回归。
+    /// MelonPreferences：`CSTI_MiniLoader/StructMemberFix`（默认 true）。
+    /// </summary>
+    public static bool StructMemberFix = true;
+
+    /// <summary>
+    /// ★ [2026-10-03 回归二分开关] 第 10 轮第二处改动：`CommonSetFld` 的"data 类型匹配就**直接写回**"分支
+    /// （去共享新实例 / 嵌套值类型子对象写回）。关掉即回到第 9 轮的"源同名成员读 → 目标同名成员写"。
+    /// MelonPreferences：`CSTI_MiniLoader/SetFldDirectWrite`（默认 true）。
+    /// </summary>
+    public static bool SetFldDirectWrite = true;
 
     /// 通用判据，不按 mod/卡名挑选）。</summary>
 

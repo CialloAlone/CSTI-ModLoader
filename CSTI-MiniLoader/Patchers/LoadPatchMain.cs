@@ -429,6 +429,7 @@ public static class LoadPatchMain
             foreach (var rm in Diag.ResolveMisses) MelonLogger.Warning(rm);
             MelonLogger.Msg("[RESOLVE] 未解析汇总: " + Diag.ResolveMisses.Count + " 条（完整清单；0 = 所有引用都解析成功）");
             Diag.DumpInlineIssues();             // [INL] 条件筛选：成功计数 + 失败去重计数（不刷屏、不 cap）
+            Diag.DumpModCardImages();            // [CARDIMG] ★ 贴图回归判据：mod 卡面原生引用读数（null=红叉）
             Diag.DumpModCardInteractions();      // [MODCARD] 精灵卡交互 dump（用户级 bug 定案）
             Diag.DumpGsmCoverage();
             Diag.DumpIntentionalSummary();          // [GSM] 有意修改的游戏卡片清单（替代"意外污染"判据）

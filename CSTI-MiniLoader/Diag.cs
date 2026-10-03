@@ -1606,6 +1606,38 @@ public static class Diag
         catch (Exception __e) { MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
     }
 
+    /// <summary>
+    /// 按「**声明类型 → 基类链**」查名字索引 —— 资产类引用（`Sprite`/`Texture2D`/`AudioClip`…）的必要通道。
+    /// 依次试每层的 `Name` 与 `FullName`；命中后由调用方用 `CastOrNull&lt;T&gt;()` **校验类型**，
+    /// 类型不符则**明确报错**（绝不静默）。注意：这**不是**"无条件全桶扫"（`NameIndexFindAny` 已删除且不恢复）——
+    /// 查找范围严格限定在声明类型的继承链内，有类型语义。
+    /// </summary>
+    public static object NameIndexFindInTypeChain(Type t, string name, out string hitBucket)
+    {
+        hitBucket = null;
+        try
+        {
+            for (var cur = t; cur != null; cur = cur.BaseType)
+            {
+                foreach (var key in new[] { cur.Name, cur.FullName })
+                {
+                    if (string.IsNullOrEmpty(key)) continue;
+                    var o = NameIndexFind(key, name);
+                    if (o != null)
+                    {
+                        hitBucket = key;
+                        return o;
+                    }
+                }
+            }
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[NAMEIDX] 类型链查找异常: " + __e.GetType().Name + " " + __e.Message);
+        }
+
+        return null;
+    }
     public static object NameIndexFind(string typeName, string name)
     {
         if (!AllIndexesBuilt) EnsureAllNameIndexes();
@@ -2002,7 +2034,11 @@ public static class Diag
         if (host == null || string.IsNullOrEmpty(name)) return false;
         try
         {
-            var mi = FindMember(host.GetType(), name);
+            // ★ [回归二分开关] `StructMemberFix=false` 时**只看属性**（第 9 轮行为）：
+            //   blittable 结构字段（public 字段）会像以前一样"没有可用 setter"→ 跳过。
+            var mi = MiniLoader.StructMemberFix
+                ? FindMember(host.GetType(), name)
+                : FindMember(host.GetType(), name, propertiesOnly: true);
             if (mi is System.Reflection.PropertyInfo p)
             {
                 if (!p.CanRead) return false;
@@ -2038,10 +2074,10 @@ public static class Diag
     /// 成员查找（**带缓存**，避免 `Type.GetProperty(name, flags)` 的 AmbiguousMatchException 与逐次反射开销）：
     /// 属性优先（跳过索引器），其次 public 实例字段。
     /// </summary>
-    private static System.Reflection.MemberInfo FindMember(Type t, string name)
+    private static System.Reflection.MemberInfo FindMember(Type t, string name, bool propertiesOnly = false)
     {
         if (t == null) return null;
-        var key = (t.AssemblyQualifiedName ?? t.Name) + "|" + name;
+        var key = (t.AssemblyQualifiedName ?? t.Name) + "|" + name + (propertiesOnly ? "|p" : "");
         if (MemberCache.TryGetValue(key, out var hit)) return hit;
         if (MemberMisses.Contains(key)) return null;
         try
@@ -2053,11 +2089,14 @@ public static class Diag
                 return p;
             }
 
-            foreach (var f in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+            if (!propertiesOnly)
             {
-                if (f.Name != name) continue;
-                MemberCache[key] = f;
-                return f;
+                foreach (var f in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                {
+                    if (f.Name != name) continue;
+                    MemberCache[key] = f;
+                    return f;
+                }
             }
         }
         catch (Exception e)
@@ -2449,6 +2488,116 @@ public static class Diag
         catch (Exception __e)
         {
             MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>
+    /// ★ [贴图回归判据] mod 卡"有没有卡面"的**内容级**读数：直接读**运行时对象**上的
+    /// `CardImage` / `CardBackground` 原生引用（null = 游戏会画红叉占位图），
+    /// 并把作者 JSON 里期望的图名一起打出来。
+    /// 用途：把"贴图丢了"从截图现象变成可判定的数据（不依赖肉眼、不依赖截图时机）。
+    /// </summary>
+    public static void DumpModCardImages()
+    {
+        try
+        {
+            var dict = MiniLoader.ItemDictionary(typeof(CardData));
+            int total = 0, hasImg = 0, noImg = 0, hasBg = 0;
+            var lines = new List<string>();
+            foreach (var kv in dict)
+            {
+                if (kv.Value is not CardData card) continue;
+                total++;
+                // ★ 必须先 Retype：这些对象常被包成基类 UniqueIDScriptable，直接用会"字段不在 gen 表"→ 假 null
+                object ro = Retype(card) ?? card;
+                var imgState = MemberState(ro, "CardImage");
+                var bgState = MemberState(ro, "CardBackground");
+                if (imgState != "null(无此成员)" && imgState != "null") hasImg++;
+                else noImg++;
+                if (bgState != "null(无此成员)" && bgState != "null") hasBg++;
+
+                var want = "（JSON 无 CardImageWarpData）";
+                try
+                {
+                    if (ModCardJsonSource.TryGetValue(kv.Key, out var js) && js != null && js.IsObject &&
+                        js.ContainsKey("CardImageWarpData"))
+                        want = js["CardImageWarpData"].ToString();
+                }
+                catch (Exception __e) { MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
+
+                var id = kv.Key.Length > 8 ? kv.Key.Substring(0, 8) : kv.Key;
+                lines.Add("[CARDIMG] " + id + " 托管类=" + ro.GetType().Name + " CardImage=" + imgState
+                          + " CardBackground=" + bgState + " 期望图=" + want);
+            }
+
+            MelonLogger.Msg("[CARDIMG] mod 卡面读数: 共=" + total + " 有CardImage=" + hasImg + " 无CardImage=" + noImg
+                            + " 有CardBackground=" + hasBg);
+            foreach (var m in lines) MelonLogger.Msg(m);   // 完整清单（无 cap）：一眼看出"哪些卡没卡面"
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[CARDIMG] 读数失败: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
+    /// <summary>
+    /// 读一个**引用型成员**的运行时状态（属性优先，其次 gen 表偏移；再退到 public 字段），
+    /// 返回 `null` / `有(名字)` / `null(无此成员)`。给"贴图有没有"这类内容级判据用。
+    /// </summary>
+    public static string MemberState(object host, string fld)
+    {
+        try
+        {
+            if (host == null) return "null(无此成员)";
+            object v = null;
+            var found = false;
+            var pi = host.GetType().GetProperty(fld);
+            if (pi != null && pi.CanRead)
+            {
+                found = true;
+                v = pi.GetValue(host);
+            }
+
+            if (!found && host is Il2CppObjectBase)
+            {
+                v = WarpperClassGen.MainGenTools.CommonGet(host, fld);
+                if (MainGenHasField(host, fld)) found = true;
+            }
+
+            if (!found)
+            {
+                var fi = host.GetType().GetField(fld);
+                if (fi != null)
+                {
+                    found = true;
+                    v = fi.GetValue(host);
+                }
+            }
+
+            if (!found) return "null(无此成员)";
+            if (v == null) return "null";
+            var nm = "";
+            try { nm = v.GetType().GetProperty("name")?.GetValue(v)?.ToString(); }
+            catch (Exception __e) { MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
+
+            var typeName = v.GetType().Name;
+            return "有(" + typeName + (string.IsNullOrEmpty(nm) ? "" : ":" + nm) + ")";
+        }
+        catch (Exception e)
+        {
+            return "err:" + e.GetType().Name;
+        }
+    }
+
+    private static bool MainGenHasField(object host, string fld)
+    {
+        try
+        {
+            return host is Il2CppObjectBase && WarpperClassGen.MainGen.GetOrGen(host.GetType()).ContainsKey(fld);
+        }
+        catch
+        {
+            return false;
         }
     }
     // ═══════════ ★ 按 JSON 形态分派引用定位（禁止"先 GUID 后名字"互相兜底） ═══════════

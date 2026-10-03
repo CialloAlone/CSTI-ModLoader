@@ -121,7 +121,8 @@ public static class MainGenTools
                 //   现在：先按类型匹配**直接写回**（①），类型不匹配再回退 ②。TryWriteMember 会做
                 //   可赋值性检查，不匹配时**什么都不写**，所以两条语义不会互相污染。
                 var ok = false;
-                if (Diag.TryWriteMember(baseObj, fld, data))
+                // ★ [回归二分开关] `SetFldDirectWrite=false` → 回到第 9 轮行为（只做"源同名成员读→目标写"）
+                if (MiniLoader.SetFldDirectWrite && Diag.TryWriteMember(baseObj, fld, data))
                 {
                     Diag.MemberDirectWrites++;
                     ok = true;
@@ -244,24 +245,35 @@ public static class MainGenTools
         if (string.IsNullOrEmpty(name)) return false;
         try
         {
-            var o = Diag.NameIndexFind(typeof(T).Name, name);
-            // [形态分派审计] 不再退到基类名（同属兜底掩盖）
-            // ★ [形态分派审计] 删除"全桶按名找"（NameIndexFindAny）：它把"类型不匹配"掩盖成"碰巧找到"。
-            //   现在只查该字段声明类型自己的名字索引；查不到就是查不到，并把索引规模打出来。
+            // ★ [2026-10-03 资产引用修复] 名字形态的解析范围 = **声明类型 → 基类链**的名字索引
+            //   （资产类引用如 `CardImage`→`Sprite` 必须走这条通道：目标对象的实际类型常是声明类型的派生/包装类型，
+            //    只查一个桶会全部落空 —— 真机实测 `名字索引[Sprite]=881 项` 却查不中 `amber`）。
+            //   注意：这**不是**"无条件全桶扫"（`NameIndexFindAny` 已删除且不恢复）：范围严格限定在继承链内。
+            var o = Diag.NameIndexFindInTypeChain(typeof(T), name, out var hitBucket);
             if (o == null)
             {
                 Diag.CountNameHit(false);
+                Diag.AddResolveMiss(typeof(T).Name, name, "名字", "?",
+                    "类型链=" + typeof(T).Name + "→基类链 未命中（各桶规模见 [NAMEIDX] 汇总）");
                 return false;
             }
 
             item = Diag.CastOrNull<T>(o);
-            if (item != null)
+            if (item == null)
             {
-                Diag.CountNameHit(true);
-                if (MiniLoader.DiagFull)   // lean 下只累计计数（原先一次冷启动几千条逐条日志）
-                    MelonLogger.Msg("[NAMEIDX] ✓ 按名解析 " + typeof(T).Name + " \"" + name + "\"");
-                return true;
+                // 命中但类型不符 → **明确报错**，绝不静默（防掩盖原则）
+                Diag.CountNameHit(false);
+                Diag.AddResolveMiss(typeof(T).Name, name, "名字-类型不符(命中桶=" + hitBucket + ")", "?",
+                    "CastOrNull<" + typeof(T).Name + "> 失败");
+                MelonLogger.Warning("[NAMEIDX] 名字命中但类型不符: 值=" + name
+                                    + " 目标类型=" + typeof(T).Name + " 命中桶=" + hitBucket);
+                return false;
             }
+
+            Diag.CountNameHit(true);
+            // 关键判据行：成功也打（lean 下同样打，否则"图片没加载"这类问题无法自证）
+            MelonLogger.Msg("[NAMEIDX] ✓ 按名解析 " + typeof(T).Name + " \"" + name + "\" 桶=" + hitBucket);
+            return true;
         }
         catch (Exception __e) { MelonLogger.Warning("[MainGenTools] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 

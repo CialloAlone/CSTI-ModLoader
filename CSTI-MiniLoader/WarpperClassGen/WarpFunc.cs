@@ -92,7 +92,7 @@ public static class WarpFunc
         //    都只认 `*WarpData`/对象/容器 ⇒ 标量一律静默跳过 ⇒ 结构字段永远保持默认值
         //    （真机 `prop=null` 95,180 行 / 30MB 日志的实质就是这一类）。
         //    判据严格限定为"**不是** Il2CppObjectBase 的托管副本"：真 il2cpp 对象仍走原路径，行为不变。
-        if (obj is not Il2CppObjectBase)
+        if (MiniLoader.StructMemberFix && obj is not Il2CppObjectBase)
         {
             ManagedStructWarp(obj, json);
             return;
