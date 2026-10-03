@@ -5683,5 +5683,23 @@ public static class Diag
         }
     }
 
+    // ═══════════ ★ [ARRAYRESIZE] 计数与口径（Round B；不重构路径） ═══════════
+    /// <summary>`[ARRAYRESIZE]` 汇总里的"就地改"计数（扩容追加计在 ArrayResizeOk）。</summary>
+    public static int ArrayInPlace;
+
+    /// <summary>`[ARRAYRESIZE] 汇总: 扩容追加=N 失败=M 就地改=K`（口径对应 GSM ADD=85 / ADD_REFERENCE=3）。</summary>
+    public static void DumpArrayResize()
+    {
+        try
+        {
+            MelonLogger.Msg("[ARRAYRESIZE] 汇总: 扩容追加=" + ArrayResizeOk + " 失败=" + ArrayResizeFail
+                            + " 就地改=" + ArrayInPlace + "（对应 GSM ADD=85 / ADD_REFERENCE=3 量级）");
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
 }
 

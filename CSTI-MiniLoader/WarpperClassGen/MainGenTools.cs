@@ -846,6 +846,12 @@ public static class MainGenTools
             }
 
             if (inPlace > 0 || appended > 0)   // 只打"确实动过"的；无数量上限（零 cap、零静默）
+                // ★ [ARRAYRESIZE 口径] 本路径即 PC WarpperFunction.cs:570 ArrayResize 的等价实现（Round A 已拆裸写）
+                Diag.ArrayResizeOk += appended;
+                Diag.ArrayInPlace += inPlace;
+                MelonLogger.Msg("[ARRAYRESIZE] 宿主=" + baseObj.GetType().Name + "." + fld + " 前=" + originalCount
+                                + " 后=" + cacheTLi.Count + " 方式=扩容追加 模式=" + warpType
+                                + "（就地改=" + inPlace + " 追加=" + appended + " 引用保留=" + preserved + "/" + originalCount + "）");
             {
                 NoWarpperLogged++;
                 MelonLogger.Msg("[ARR] 对象元素数组(NoWarpper): " + baseObj.GetType().Name + "." + fld

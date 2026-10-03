@@ -430,6 +430,7 @@ public static class LoadPatchMain
             try { PatchTest.Enumerate(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             try { PatchTest.Install(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             try { DragProbe.Install(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
+            Diag.DumpArrayResize();               // [ARRAYRESIZE] 扩容追加计数（不重构路径）
             Diag.DumpReadback();                 // [READBACK] 读回校验降级收益
             Diag.DumpWarpLoop();                 // [WARP-LOOP] 汇总（宿主类/实例数/提前退出）
             Diag.DumpWarpKeys();                 // [WARP-KEY] 键级汇总（处理/写入/跳过）
