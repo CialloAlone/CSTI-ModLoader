@@ -705,27 +705,17 @@ public static class MainGenTools
                                     + " 请求=" + warpData.Count + " 解析到=" + cacheTLi.Count);
                 }
 
-                // [FIX] 不用托管索引器 / Il2CppClassPointerStore 分配（真机实测在填充时 SIGSEGV）：
-                // 用字段自身的 il2cpp 类型 il2cpp_array_new，再按数组头偏移直接写槽位。
-                var fieldKlass = IL2CPP.il2cpp_class_from_il2cpp_type(IL2CPP.il2cpp_field_get_type(tuple.fPtr));
-                Trace("[ARR] 字段数组类=0x" + fieldKlass.ToInt64().ToString("X") + " 元素数=" + cacheTLi.Count);
-                if (fieldKlass == IntPtr.Zero) return;
-
-                var arrPtr = IL2CPP.il2cpp_array_new(fieldKlass, (ulong)cacheTLi.Count);
-                Trace("[ARR] 新数组=0x" + arrPtr.ToInt64().ToString("X"));
-                if (arrPtr == IntPtr.Zero) return;
-
-                var header = IntPtr.Size == 8 ? 0x20 : 0x10;
+                // ★★ [2026-10-03 拆裸写] 原实现用 `il2cpp_array_new` + "数组头偏移直接写槽位"（裸内存 ✗，
+                //    当年启动 SIGSEGV 的同一类写法）—— 现改为**纯托管**写法（与 SetArrNoWarpper 的 :867 同款 ✓）：
+                //    `Array.CreateInstance(Il2CppType.Of<T>(), n)` → 逐元素 SetValue → 整块写回字段（写屏障 ✓）。
+                var newArr = Array.CreateInstance(Il2CppType.Of<T>(), cacheTLi.Count);
                 for (var i = 0; i < cacheTLi.Count; i++)
-                {
-                    var slot = arrPtr + header + i * IntPtr.Size;
-                    IL2CPP.il2cpp_gc_wbarrier_set_field(arrPtr, slot, IL2CPP.Il2CppObjectBaseToPtr(cacheTLi[i]));
-                }
+                    newArr.SetValue((Object)(Il2CppObjectBase)cacheTLi[i], i);
 
-                Trace("[ARR] 填充完成");
-                IL2CPP.il2cpp_gc_wbarrier_set_field(objHandle, objHandle + tuple.fOffset, arrPtr);
-                Trace("[ARR] 写回完成 " + fld);
-                if (ArrTrace < 25) MelonLogger.Msg("[ARR] 写回完成 " + fld);
+                IL2CPP.il2cpp_gc_wbarrier_set_field(objHandle, objHandle + tuple.fOffset,
+                    IL2CPP.Il2CppObjectBaseToPtr(newArr));
+                Trace("[ARR] 写回完成(托管重建) " + fld);
+                if (ArrTrace < 25) MelonLogger.Msg("[ARR] 写回完成(托管重建) " + fld);
             }
         }
     }

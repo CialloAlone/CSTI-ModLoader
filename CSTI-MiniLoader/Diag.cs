@@ -5635,5 +5635,53 @@ public static class Diag
         catch { }
     }
 
+    // ═══════════ ★ [ARRAYRESIZE] 照 PC（WarpperFunction.cs:570）语义的"原地扩容 + 尾部追加"（纯托管） ═══════════
+    public static int ArrayResizeOk, ArrayResizeFail;
+
+    /// <summary>
+    /// 读旧数组 → 建新数组（old+M）→ 逐元素复制 → 尾部追加 refs → **整块写回字段**（属性优先 → public 字段）
+    /// → **复读验证长度 = old+M**。全程纯托管（`Array.CreateInstance` + `SetValue` + 成员写回），**零裸内存** ✓。
+    /// 语义对照 PC：`ArrayResize(ref instance, data.Count + instance.Length)`（`WarpperFunction.cs:256/513/556/570`）。
+    /// 本轮**只新增、不接线**（第 B 轮才把 ADD/ADD_REFERENCE 接过来）。
+    /// </summary>
+    public static bool ArrayResizeAppend(object host, string fld, System.Collections.Generic.IList<object> refs, string tag)
+    {
+        try
+        {
+            if (host == null || refs == null) return false;
+            var oldObj = Member(host, fld);                       // 属性优先 → public 字段（Member 已含此逻辑）
+            var old = oldObj as Array;
+            var oldLen = old?.Length ?? 0;
+            var elemType = old != null ? old.GetType().GetElementType() : null;
+            if (elemType == null) { ArrayResizeFail++; NoteSilentReturn("ArrayResizeAppend", host.GetType().Name, fld, "元素类型取不到（旧值为空或非数组）"); return false; }
+
+            var newArr = Array.CreateInstance(elemType, oldLen + refs.Count);
+            for (var i = 0; i < oldLen; i++) newArr.SetValue(old.GetValue(i), i);
+            for (var i = 0; i < refs.Count; i++) newArr.SetValue(refs[i], oldLen + i);
+
+            if (!TryWriteMember(host, fld, newArr))
+            {
+                ArrayResizeFail++;
+                NoteSilentReturn("ArrayResizeAppend", host.GetType().Name, fld, "整块写回被拒");
+                return false;
+            }
+
+            var back = Member(host, fld) as Array;
+            var ok = back != null && back.Length == oldLen + refs.Count;
+            if (!ok) { ArrayResizeFail++; NoteSilentReturn("ArrayResizeAppend", host.GetType().Name, fld, "复读长度不符"); return false; }
+
+            ArrayResizeOk++;
+            MelonLogger.Msg("[ARRAYRESIZE] 宿主=" + host.GetType().Name + "." + fld + " 前=" + oldLen
+                            + " 后=" + (oldLen + refs.Count) + " 方式=扩容追加 来源=" + tag);
+            return true;
+        }
+        catch (Exception e)
+        {
+            ArrayResizeFail++;
+            MelonLogger.Warning("[ARRAYRESIZE] 失败 " + (host?.GetType().Name ?? "?") + "." + fld + ": " + e.GetType().Name + " " + e.Message);
+            return false;
+        }
+    }
+
 }
 
