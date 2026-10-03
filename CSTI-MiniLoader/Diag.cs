@@ -1624,6 +1624,30 @@ public static class Diag
                 {
                     if (string.IsNullOrEmpty(key)) continue;
                     var o = NameIndexFind(key, name);
+
+                    // ★★ [NAMEIDX 链级兜底 · 2026-10-03] 该级桶 miss → 补登记该桶一次 → 再试该桶一次。
+                    //    实证：Cart 的 miss 就发生在这一层（日志里只有 EquipmentTag/ScriptableObject/Object 的兜底行）。
+                    //    幂等、只在 miss 时执行、命中路径零开销、不改写入行为。
+                    if (o == null)
+                    {
+                        try
+                        {
+                            ReapplyNameRegistrations(key);
+                            NameIndexChainReplay++;
+                            o = NameIndexFind(key, name);
+                            if (o != null)
+                            {
+                                NameIndexChainReplayOk++;
+                                MelonLogger.Msg("[NAMEIDX] 链兜底 桶=" + key + " 名字=" + name + "（补登记后命中 ✓）");
+                            }
+                            else if (NameIndexChainReplay <= 20)
+                            {
+                                MelonLogger.Msg("[NAMEIDX] 链兜底 桶=" + key + " 名字=" + name + "（补登记后仍未命中）");
+                            }
+                        }
+                        catch { }
+                    }
+
                     if (o != null)
                     {
                         hitBucket = key;
@@ -1649,6 +1673,8 @@ public static class Diag
     public static int NameIndexRegistered;
     /// <summary>[NAMEIDX] 查找 miss 触发"补登记后重查"的次数（幂等兜底；实证：Cart 在 warp 时被重建吃掉登记）。</summary>
     public static int NameIndexMissReplay;
+    /// <summary>[NAMEIDX] 类型链级兜底（每级桶 miss 后补登记重试）的成功/尝试次数。</summary>
+    public static int NameIndexChainReplay, NameIndexChainReplayOk;
 
     /// <summary>
     /// 把一个**我们自建的资产**（例如 mod 图集抠出来的 `Sprite`）登记进名字索引 —— 否则它只在 mod 私有
