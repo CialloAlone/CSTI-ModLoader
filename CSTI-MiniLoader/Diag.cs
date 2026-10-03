@@ -1812,6 +1812,24 @@ public static class Diag
         }
     }
 
+    /// <summary>[只读] 某桶的快照（供只读探针使用，避免暴露内部字典）。</summary>
+    public static List<KeyValuePair<string, object>> NameIndexSnapshot(string bucket)
+    {
+        var res = new List<KeyValuePair<string, object>>();
+        try { if (NameIndex.TryGetValue(bucket, out var d) && d != null) foreach (var kv in d) res.Add(kv); }
+        catch { }
+        return res;
+    }
+
+    /// <summary>[只读] 各桶项数。</summary>
+    public static List<string> NameIndexCounts()
+    {
+        var res = new List<string>();
+        try { foreach (var kv in NameIndex) { int c = 0; try { c = kv.Value?.Count ?? 0; } catch { } res.Add(kv.Key + "=" + c); } }
+        catch { }
+        return res;
+    }
+
     public static void NoteNameIndex(string bucket, string name, object obj)
     {
         try
