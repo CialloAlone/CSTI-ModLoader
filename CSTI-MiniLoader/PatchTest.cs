@@ -333,6 +333,43 @@ namespace CSTI_MiniLoader
                                             + " AllDrops=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()));
                 }
 
+                // ★ 原版同类卡对照（只读）：名字去掉 "<前缀>_" 后找原版卡，打印它的 AllDrops
+                try
+                {
+                    var all = MiniLoader.ItemDictionary(typeof(CardData));
+                    var byName = new System.Collections.Generic.Dictionary<string, object>();
+                    foreach (var kv2 in all)
+                    {
+                        object ro2 = null;
+                        try { ro2 = Diag.Retype(kv2.Value) ?? kv2.Value; } catch { }
+                        var nm2 = ro2 == null ? null : Diag.NameOf(ro2);
+                        if (!string.IsNullOrEmpty(nm2) && !byName.ContainsKey(nm2)) byName[nm2] = ro2;
+                    }
+
+                    int cmpOk = 0, cmpMissing = 0, cmpNeedFix = 0;
+                    foreach (var kv3 in all)
+                    {
+                        object ro3 = null;
+                        try { ro3 = Diag.Retype(kv3.Value) ?? kv3.Value; } catch { }
+                        if (ro3 == null || !Diag.ModCardJsonSource.ContainsKey(kv3.Key)) continue;
+                        var dl3 = Diag.Member(ro3, "AllDrops");
+                        if (dl3 != null && (int)Diag.ElemCount(dl3) > 0) continue;   // 非空的不看
+                        var nm3 = Diag.NameOf(ro3) ?? "";
+                        var bare = nm3;
+                        var us = nm3.IndexOf("_", StringComparison.Ordinal);
+                        if (us > 0) bare = nm3.Substring(us + 1);
+                        object orig = null;
+                        if (byName.ContainsKey(bare)) orig = byName[bare];
+                        if (orig == null) { cmpMissing++; MelonLogger.Warning("[PHASE2-ORIG] " + nm3 + " → 找不到原版同类卡（无法对照）"); continue; }
+                        var dlo = Diag.Member(orig, "AllDrops");
+                        var cnt = dlo == null ? -1 : (int)Diag.ElemCount(dlo);
+                        if (cnt <= 0) { cmpOk++; MelonLogger.Msg("[PHASE2-ORIG] " + nm3 + " AllDrops=0 ↔ 原版 " + bare + " AllDrops=" + cnt + " ⇒ 本来就无掉落 ✓"); }
+                        else { cmpNeedFix++; MelonLogger.Warning("[PHASE2-ORIG] " + nm3 + " AllDrops=0 ↔ 原版 " + bare + " AllDrops=" + cnt + " ⇒ **应有而无 ✗（需要更晚时机）**"); }
+                    }
+
+                    MelonLogger.Warning("[PHASE2-ORIG] 对照汇总: 本来就无掉落=" + cmpOk + " 应有而无=" + cmpNeedFix + " 找不到原版=" + cmpMissing);
+                }
+                catch (Exception eo) { MelonLogger.Warning("[PHASE2-ORIG] 对照失败: " + eo.GetType().Name + " " + eo.Message); }
                 MelonLogger.Warning("[PHASE2] 空掉落表清单（无 cap）: " + string.Join(", ", emptyList));
                 MelonLogger.Warning("[PHASE2] 游戏自己 Init() 的验证: mod 卡=" + n + " UniqueID 非空=" + idOk
                                     + " AllDrops 非空=" + dropOk

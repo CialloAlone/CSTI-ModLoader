@@ -5616,6 +5616,14 @@ public static class Diag
     private static readonly List<string> PhaseOrder = new();
 
     /// <summary>`[PHASE-ORDER] <标记> t=…ms`（累计毫秒，便于判定"创建是否赶在 ClearDict 之前"）。</summary>
+    private static readonly HashSet<string> PhaseMarkSeen = new();
+
+    /// <summary>同一 tag 只打一次的 PhaseMark（避免每帧重复，如 t2）。</summary>
+    public static void PhaseMarkOnce(string tag)
+    {
+        try { if (!PhaseMarkSeen.Add(tag)) return; PhaseMark(tag); } catch { }
+    }
+
     public static void PhaseMark(string tag)
     {
         try
