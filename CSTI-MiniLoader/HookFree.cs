@@ -60,6 +60,7 @@ namespace CSTI_MiniLoader
         public static void Tick()
         {
             Diag.Heartbeat();
+            try { PostSpriteQueue.Flush(); } catch { }   // [POSTSPRITE] 只执行队列（不做逻辑判断）
             // [PHASE2] 验证已移到"加载完成之后"（LoadPatchMain），避免早于 mod 卡创建
             if (MiniLoader.InitDone) { try { Diag.PhaseMarkOnce("t2=我们自己的 Init 完成"); } catch { } try { DropsFix.RunAll("A:我们自己的Init之后"); } catch { } }   // [DROPSFIX] 时机 A   // [PHASE2] 只读验证（内部自带 60s 门与一次性标志）   // ★ 主线程停顿心跳（只在 >500ms 不推进时打一行）
             try

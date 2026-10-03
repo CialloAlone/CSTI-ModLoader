@@ -396,6 +396,16 @@ public static class MainGenTools
             }
             else
             {
+                // ★★ [POSTSPRITE 接线] 照 PC（PostSpriteLoad.cs:41/65 + WarpperFunction.cs:44 `PostSetEnQueue`）：
+                //    Sprite/AudioClip 类引用**先入队**，由 Tick 泵 flush 统一应用（默认关：cfg PostSpriteLoadQueue=true）。
+                //    未启用时 Enqueue 返回 false → 照旧立刻写（行为不变 ✓）。
+                {
+                    var ft = tuple.fldType;
+                    var isAssetRef = ft == typeof(UnityEngine.Sprite) || ft == typeof(UnityEngine.AudioClip)
+                                      || (ft != null && ft.FullName != null && (ft.FullName.EndsWith(".Sprite") || ft.FullName.EndsWith(".AudioClip")));
+                    if (isAssetRef && PostSpriteQueue.Enqueue(baseObj, fld, (Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)(object)item))
+                        return;   // 已入队 → 稍后 flush（数量在 [POSTSPRITE] 里可见 ✓）
+                }
                 IL2CPP.il2cpp_gc_wbarrier_set_field(objHandle, objHandle + tuple.fOffset,
                     IL2CPP.Il2CppObjectBaseToPtr((Il2CppObjectBase)(object)item));
                 // ★★ [对象身份 / 验证式回退] 写屏障之后**当场验证**：若字段仍为空 ⇒ 说明这次写没落到
