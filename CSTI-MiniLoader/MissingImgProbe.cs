@@ -6,12 +6,13 @@ namespace CSTI_MiniLoader
 {
     /// <summary>
     /// [MISSIMG] **只读**缺图点名 + 原版素材名排查（零行为改动：不写游戏对象、不改索引、不加 Hook）。
-    /// · Run()：逐张点名 CardImage 为空的 mod 卡（卡名/期望图名/索引命中桶/当前值/未解析行 + 三态定性，无 cap）
-    /// · FuzzySearch(bucket, frag)：在某桶里模糊找名字（忽略大小写），标注来源（游戏注册表 / mod 图集）
-    /// · VanillaCardImage(frag)：找名字含 frag 的**原版卡**，打印其 CardImage 运行时值与 sprite.name（权威名字）
-    /// · CoverageReadout()：名字索引各桶项数 + 已登记 mod 资产数 + mod sprite 字典数
-    /// 注：定性文案已按 Lead 更正 —— "索引里查不到"**不等于**"数据里没这张图"，
-    ///     也可能是"我们查不到原版素材"（见 docs/loader/PC-LOADER-FLOW.md §14.4）。
+    /// · Run()：逐张点名 CardImage 为空的 mod 卡（三态定性，无 cap）+ 触发下面几个只读探针
+    /// · FuzzySearch(bucket, frag)：桶内模糊找名字（忽略大小写），标注来源（游戏注册表 / mod 图集）
+    /// · VanillaCardImage(frag)：名字含 frag 的**原版卡** → 其 CardImage 运行时值 + sprite.name
+    /// · VanillaCardByName(frag)：同上但支持中文片段（本地化名），列最多 10 条
+    /// · ChineseNameSample(max)：Sprite 桶里"名字含中文"的项抽样（验证移动端素材名是否中文）
+    /// · CoverageReadout()：名字索引各桶项数 + 已登记 mod 资产 + mod sprite 字典数
+    /// 注：③ 的定性按 Lead 更正为"索引里查不到（可能是原版素材未收录/命名不同），未必是数据问题"。
     /// </summary>
     public static class MissingImgProbe
     {
@@ -54,7 +55,7 @@ namespace CSTI_MiniLoader
                     string state;
                     if (modHit != null) { state = "② 只在 mod 图集里（查登记时机）"; hitMod++; }
                     else if (gameHit != null) { state = "① 游戏资产里有（查写入路径）"; hitGame++; }
-                    else { state = "③ 索引里查不到（可能是原版素材未收录，需按原版同类卡的 CardImage 取名，未必是数据问题）"; noWhere++; }
+                    else { state = "③ 索引里查不到（可能是原版素材未收录/命名不同，未必是数据问题）"; noWhere++; }
 
                     var missLine = "无";
                     try
@@ -78,6 +79,10 @@ namespace CSTI_MiniLoader
 
                 FuzzySearch("Sprite", "meteor");
                 VanillaCardImage("Meteor");
+                VanillaCardByName("陨石");
+                VanillaCardByName("流星");
+                VanillaCardByName("Meteor");
+                ChineseNameSample(30);
                 CoverageReadout();
             }
             catch (Exception e)
@@ -86,7 +91,6 @@ namespace CSTI_MiniLoader
             }
         }
 
-        // ═══════════ [MISSIMG-PROBE] 只读：原版素材名排查 ═══════════
         public static void FuzzySearch(string bucket, string frag)
         {
             try
@@ -142,6 +146,72 @@ namespace CSTI_MiniLoader
                 MelonLogger.Msg("[MISSIMG-PROBE] 名字含\"" + frag + "\"的原版卡=" + n + "（最多列 8 条）");
             }
             catch (Exception e) { MelonLogger.Warning("[MISSIMG-PROBE] VanillaCardImage 失败: " + e.GetType().Name + " " + e.Message); }
+        }
+
+        /// <summary>[只读] 按名字片段（支持中文）找原版卡 → CardImage + sprite.name（移动端真实素材名）。</summary>
+        public static void VanillaCardByName(string frag)
+        {
+            try
+            {
+                var dict = MiniLoader.ItemDictionary(typeof(CardData));
+                int n = 0, shown = 0;
+                foreach (var kv in dict)
+                {
+                    object ro = null;
+                    try { ro = Diag.Retype(kv.Value) ?? kv.Value; } catch { }
+                    if (ro == null) continue;
+                    var isMod = false;
+                    try { isMod = Diag.ModCardJsonSource.ContainsKey(kv.Key); } catch { }
+                    if (isMod) continue;
+                    var nm = Diag.NameOf(ro) ?? "";
+                    if (nm.IndexOf(frag, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    n++;
+                    if (shown++ < 10)
+                    {
+                        var img = Diag.Member(ro, "CardImage");
+                        var sn = "";
+                        try { sn = img == null ? "" : (Diag.Member(img, "name")?.ToString() ?? ""); } catch { }
+                        MelonLogger.Warning("[MISSIMG-PROBE] 原版卡(名含\"" + frag + "\")=" + nm
+                                            + " CardImage=" + (img == null ? "null" : Diag.Cls(img))
+                                            + " sprite.name=" + (sn.Length == 0 ? "(空)" : sn));
+                    }
+                }
+                MelonLogger.Msg("[MISSIMG-PROBE] 名字含\"" + frag + "\"的原版卡=" + n + "（最多列 10 条）");
+            }
+            catch (Exception e) { MelonLogger.Warning("[MISSIMG-PROBE] VanillaCardByName 失败: " + e.GetType().Name + " " + e.Message); }
+        }
+
+        /// <summary>[只读] Sprite 桶里"名字含中文"的项抽样（验证"移动端素材名是否中文"）。</summary>
+        public static void ChineseNameSample(int max)
+        {
+            try
+            {
+                var snap = Diag.NameIndexSnapshot("Sprite");
+                int cn = 0, shown = 0;
+                var outLines = new List<string>();
+                foreach (var kv in snap)
+                {
+                    var hasCn = false;
+                    try
+                    {
+                        var s = kv.Key ?? "";
+                        foreach (var ch in s) if (ch >= 0x4E00 && ch <= 0x9FFF) { hasCn = true; break; }
+                    }
+                    catch { }
+                    if (!hasCn) continue;
+                    cn++;
+                    if (shown++ < max)
+                    {
+                        var sn = "";
+                        try { sn = Diag.Member(kv.Value, "name")?.ToString() ?? ""; } catch { }
+                        outLines.Add("[MISSIMG-PROBE] 中文名项=" + kv.Key + " sprite.name=" + sn
+                                     + " 类型=" + (kv.Value == null ? "null" : Diag.Cls(kv.Value)));
+                    }
+                }
+                MelonLogger.Msg("[MISSIMG-PROBE] Sprite 桶总项=" + snap.Count + " 含中文项=" + cn + "（抽样 " + outLines.Count + " 条）");
+                foreach (var l in outLines) MelonLogger.Warning(l);
+            }
+            catch (Exception e) { MelonLogger.Warning("[MISSIMG-PROBE] ChineseNameSample 失败: " + e.GetType().Name + " " + e.Message); }
         }
 
         public static void CoverageReadout()

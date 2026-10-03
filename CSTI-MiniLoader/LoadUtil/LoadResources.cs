@@ -430,6 +430,7 @@ public static class LoadResources
 
     public static void WarpperAllEditorGameSrouces()
     {
+            try { Diag.PhaseMarkOnce("[ANCHOR] WarpperAllEditorGameSrouces 入口（warp 内候选）"); } catch { }
         // var bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
         //foreach (var item in WaitForWarpperEditorGameSourceGUIDList)
         while (WaitForWarpperEditorGameSourceGUIDList.Count > 0)
