@@ -59,6 +59,9 @@ namespace CSTI_MiniLoader
                     if (o == null) continue;
 
                     var dl = Diag.Member(o, "AllDrops");
+                    if (n == 1 && phase.StartsWith("B"))
+                        MelonLogger.Warning("[DROPSFIX] 时机=B 前置: CardModel=" + (Diag.Member(o, "CardModel") == null ? "null" : "非null")
+                                            + " AllDrops.Length=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()));   // 只读
                     if (dl != null && (int)Diag.ElemCount(dl) == 0) beforeEmpty++;
 
                     try

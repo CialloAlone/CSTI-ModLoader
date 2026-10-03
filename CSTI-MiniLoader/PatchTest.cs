@@ -284,6 +284,7 @@ namespace CSTI_MiniLoader
                     }
                 }
 
+                Diag.PhaseMark("t3=append 完成 成功=" + Appended);   // [PHASE-ORDER]
                 MelonLogger.Warning("[PHASE2] 已 append 进 AllData: 成功=" + Appended + " 跳过=" + AppendedSkipped
                                     + " 之后 AllData.Count=" + Diag.ElemCount(allData));
             }
@@ -306,13 +307,14 @@ namespace CSTI_MiniLoader
         }
 
         /// <summary>只读验证：游戏是否在 ClearDict 之后自己遍历 AllData 调了 Init()（判据：UniqueID 非空 / AllDrops 非空）。</summary>
-        public static void Phase2Verify()
+        public static void Phase2Verify(bool loadDone = false)
         {
             try
             {
                 if (_verified) return;   // ★ 常开：不依赖 Diag_Phase2Append（让"空掉落表"可追踪）
                 if (Environment.TickCount64 - _appendedAt < 60000) return;
                 _verified = true;
+                Diag.PhaseMark("t4=游戏 Init 之后（只读验证点）");   // [PHASE-ORDER]
 
                 var dict = MiniLoader.ItemDictionary(typeof(CardData));
                 int n = 0, idOk = 0, dropOk = 0;
