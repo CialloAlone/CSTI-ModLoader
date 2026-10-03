@@ -525,6 +525,9 @@ public static class LoadArchMod
                             sprite.name = sprite_name;
                             if (!ItemDictionary(typeof(Sprite)).ContainsKey(sprite_name))
                                 ItemDictionary(typeof(Sprite)).Add(sprite_name, sprite);
+                            // ★ [名字索引登记] mod 自建 sprite 也要能被"按名引用"找到（否则 `amber`/`amber_necklace`
+                            //   这类 mod 独有名字永远解析不到 ✗）。通用：所有 mod 资产一视同仁 ✓。
+                            Diag.NoteNameIndex("Sprite", sprite_name, sprite);
                             okSprites++;
                             if (okSprites <= 6)
                                 MelonLogger.Msg($"[IMG2] 精灵 ✓ {sprite_name} {rw}x{rh} png={png.Length}B tex=0x{smallTex.ToInt64():X} sprite=0x{spritePtr.ToInt64():X} 纹理回读=0x{Diag.GetSpriteTextureViaIcall(spritePtr).ToInt64():X}");

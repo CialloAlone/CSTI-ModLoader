@@ -1638,18 +1638,247 @@ public static class Diag
 
         return null;
     }
+    /// <summary>
+    /// 名字索引查找：**① 精确 → ② 忽略大小写 → ③ 归一化（去 `_`/`-`/空格 + 小写）**。
+    /// 依据（真机反例）：同一宿主同一字段，JSON 值 `Bed` 能解析 ✓，而 `amber`/`amber_necklace`/`poison`/`arrow` 全部失败 ✗
+    /// —— 作者 JSON 用**小写/下划线**风格、游戏资产键用**首字母大写/驼峰**风格 ⇒ 大小写不敏感 + 归一化是**必要通道**，
+    /// 不是"兜底掩盖"（与 `Sprite` 基类链同理）。命中打一行 `[NAMEIDX] 命中(忽略大小写/归一化)`，成功计数、未命中逐条、无 cap。
+    /// </summary>
+    // ═══════════ ★ 名字索引"登记"通道（mod 自建资产也要能被自己引用） ═══════════
+    public static int NameIndexRegistered;
+
+    /// <summary>
+    /// 把一个**我们自建的资产**（例如 mod 图集抠出来的 `Sprite`）登记进名字索引 —— 否则它只在 mod 私有
+    /// 字典里，名字解析永远找不到（真机证据：`poison`/`arrow`/`bed` 能解析 ✓ 因为它们与游戏资产同名，
+    /// 而 `amber`/`amber_necklace` 是 mod 独有 ✗ → 索引里根本没有 ✗）。
+    /// **通用**：任何 mod 自建的同名资产都能被自己的 JSON 引用；不按 mod/卡名特判 ✓。
+    /// </summary>
+    // ═══════════ ★ "跳过结论缓存"（同一道题别重解十万遍；不是 cap，信息不丢） ═══════════
+    private static readonly HashSet<string> StructWriteImpossible = new();
+    public static int StructSkipCacheHits;
+    /// <summary>加载起点（类初始化即计时）；汇总行里带"耗时=Nms"，便于判断缓存到底省了多少。</summary>
+    public static readonly long LoadStartMs = Environment.TickCount64;
+    public static long ElapsedMs => Environment.TickCount64 - LoadStartMs;
+
+    /// <summary>某 (宿主类型, 字段) 是否已判定"写不进"（内联值类型代理通道不可用）。命中则调用方直接跳过、
+    /// 不再重解（真机 95,192 次跳过里绝大多数是同一道题）。首次仍逐条打印、唯一原因全量保留、汇总计数不变
+    /// —— 这是"结论缓存"，不是 cap（信息一条不少）。</summary>
+    public static bool StructWriteKnownImpossible(string hostType, string fld)
+    {
+        var k = hostType + "." + fld;
+        if (StructWriteImpossible.Contains(k))
+        {
+            StructSkipCacheHits++;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>登记"该 (宿主类型,字段) 写不进"的结论（供后续同类实例直接命中缓存）。</summary>
+    public static void MarkStructWriteImpossible(string hostType, string fld)
+    {
+        try { StructWriteImpossible.Add(hostType + "." + fld); } catch { }
+    }
+
+    // ═══════════ ★ 主线程停顿心跳（卡死定位：只在"不推进 >500ms"时打一行） ═══════════
+    private static long _hbLastTicks;
+    private static int _hbFrames;
+    public static int StallEvents;
+
+    /// <summary>每帧调用；仅当"距上一帧 >500ms"（主线程被卡住）时打一行 [HB]；正常推进只计数。</summary>
+    public static string ActionNm(object o)
+    {
+        try
+        {
+            var ro = Retype(o) ?? o;
+            var an = Member(ro, "ActionName");
+            if (an == null) return "-";
+            var txt = Member(an, "DefaultText") ?? Member(an, "LocalizationKey");
+            return (txt?.ToString() ?? an.ToString() ?? "-");
+        }
+        catch { return "-"; }
+    }
+    // ═══════════ ★ [DRAG] 只读进出环形缓冲（保留最后 50 条；只在停顿/异常时整段打印） ═══════════
+    private static readonly Queue<string> DragRing = new();
+    private static int _dragSeq;
+    public static int DragEmptyDumps;
+
+    /// <summary>记录一次拖拽路径进/出（写入环形缓冲，正常推进不打印任何东西）。</summary>
+    public static void DragMark(string dir, string method)
+    {
+        try
+        {
+            _dragSeq++;
+            DragRing.Enqueue(_dragSeq + " " + dir + " " + method);
+            while (DragRing.Count > 50) DragRing.Dequeue();
+        }
+        catch { }
+    }
+
+    /// <summary>把环形缓冲整段打印（停顿/异常时调用；正常情况一行都不打 ✓）。</summary>
+    public static void DragDump(string reason)
+    {
+        try
+        {
+            var arr = DragRing.ToArray();
+            if (arr.Length == 0) { DragEmptyDumps++; return; }   // 缓冲为空 → 不打空转储（启动期不再多一条）
+            MelonLogger.Warning("[DRAG] 缓冲转储（" + reason + "）: 共 " + arr.Length + " 条（最后 50 条）");
+            foreach (var s in arr) MelonLogger.Warning("[DRAG]   " + s);
+            if (arr.Length > 0)
+            {
+                // 最后一条"只有 → 没有 ←"的就是卡点
+                var last = arr[arr.Length - 1];
+                if (last.Contains(" → "))
+                    MelonLogger.Warning("[DRAG] ★ 最后一个有进无出的方法: " + last);
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>拖拽相关读数：宿主上的 CardInteractions 条数（判断"交互求值"是否还在跑）。</summary>
+    public static void DragState(string phase, object host)
+    {
+        try
+        {
+            if (host == null)
+            {
+                MelonLogger.Msg("[DRAG-STATE] " + phase + " 宿主=null");
+                return;
+            }
+
+            object ro = null;
+            try { ro = Retype(host) ?? host; } catch { }
+            var ci = ro == null ? null : Member(ro, "CardInteractions");
+            var n = (int)ElemCount(ci);
+            MelonLogger.Msg("[DRAG-STATE] " + phase + " 宿主=" + (NameOf(ro) ?? Cls(ro))
+                            + " CardInteractions=" + n + " 项");
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[DRAG-STATE] 读取失败: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
+    public static void Heartbeat()
+    {
+        try
+        {
+            var now = Environment.TickCount64;
+            if (_hbLastTicks != 0)
+            {
+                var gap = now - _hbLastTicks;
+                if (gap > 500)
+                {
+                    StallEvents++;
+                    MelonLogger.Warning("[HB] 主线程停顿: 帧=" + _hbFrames + " 停顿=" + gap + "ms 累计停顿事件=" + StallEvents);
+                    DragDump("主线程停顿 " + gap + "ms");   // ★ 停顿即转储拖拽缓冲（唯一输出时机）
+                    DumpDragCost("主线程停顿 " + gap + "ms", -1, -1);   // ★ 工作量计数（算不完 vs 死锁）
+                }
+            }
+
+            _hbFrames++;
+            _hbLastTicks = now;
+        }
+        catch { }
+    }
+
+    public static void NoteNameIndex(string bucket, string name, object obj)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(bucket) || string.IsNullOrEmpty(name) || obj == null) return;
+            if (!AllIndexesBuilt) EnsureAllNameIndexes();
+            if (!NameIndex.TryGetValue(bucket, out var d) || d == null)
+            {
+                d = new Dictionary<string, object>();
+                NameIndex[bucket] = d;
+            }
+
+            if (d.ContainsKey(name)) return;   // 已存在（游戏资产优先）→ 不覆盖
+            d[name] = obj;
+            NameIndexRegistered++;
+            MelonLogger.Msg("[NAMEIDX] 注册(mod sprite): 名=" + name + " 桶=" + bucket
+                            + " 累计=" + NameIndexRegistered);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[NAMEIDX] 注册失败: " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
     public static object NameIndexFind(string typeName, string name)
     {
+        if (string.IsNullOrEmpty(name)) return null;
         if (!AllIndexesBuilt) EnsureAllNameIndexes();
-        if (NameIndex.TryGetValue(typeName, out var d) && d.TryGetValue(name, out var o)) return o;
+        if (NameIndex.TryGetValue(typeName, out var d))
+        {
+            if (d.TryGetValue(name, out var o)) return o;                      // ① 精确
+            var ci = FindLoose(d, name, typeName);
+            if (ci != null) return ci;                                        // ②/③ 忽略大小写 → 归一化
+        }
+
         if (!WantedContains(typeName))
         {
             EnsureNameIndex(typeName);      // 预设集合外的类型 → 单类型兜底扫描
             if (NameIndex.TryGetValue(typeName, out var d2) && d2.TryGetValue(name, out var o2)) return o2;
+            if (d2 != null)
+            {
+                var ci2 = FindLoose(d2, name, typeName);
+                if (ci2 != null) return ci2;
+            }
         }
 
         return null;
     }
+
+    private static int NameLooseHits;
+
+    /// <summary>② 忽略大小写 → ③ 归一化；命中打一行（含实际键名与桶名）。</summary>
+    private static object FindLoose(Dictionary<string, object> d, string name, string bucket)
+    {
+        try
+        {
+            foreach (var kv in d)
+            {
+                if (string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    NameLooseHits++;
+                    MelonLogger.Msg("[NAMEIDX] 命中(忽略大小写): 查询=" + name + " 实际键=" + kv.Key + " 桶=" + bucket);
+                    return kv.Value;
+                }
+            }
+
+            var norm = NormName(name);
+            if (norm.Length == 0) return null;
+            foreach (var kv in d)
+            {
+                if (NormName(kv.Key) == norm)
+                {
+                    NameLooseHits++;
+                    MelonLogger.Msg("[NAMEIDX] 命中(归一化): 查询=" + name + " 实际键=" + kv.Key + " 桶=" + bucket);
+                    return kv.Value;
+                }
+            }
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[NAMEIDX] 宽松匹配异常: " + __e.GetType().Name + " " + __e.Message);
+        }
+
+        return null;
+    }
+
+    /// <summary>归一化：去掉 `_`/`-`/空格 后转小写（`amber_necklace` ↔ `AmberNecklace`）。</summary>
+    private static string NormName(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (var c in s)
+            if (c != (char)95 && c != (char)45 && c != (char)32) sb.Append(char.ToLowerInvariant(c));
+        return sb.ToString();
+    }
+
 
     private static bool WantedContains(string t)
     {
@@ -2129,7 +2358,20 @@ public static class Diag
             if (mi is System.Reflection.PropertyInfo p)
             {
                 if (!p.CanWrite) return false;
-                if (value != null && !p.PropertyType.IsInstanceOfType(value)) return false;
+                if (value != null && !p.PropertyType.IsInstanceOfType(value))
+                {
+                    // ★ [SETFLD] 先尝试**指针级转换到字段声明类型**（代理退化时这也意味着类型其实是兼容的）；
+                    //   转不过去才判"真类型不符"并**明确上报**（绝不静默 return false）。
+                    var casted = TryCastToDeclared(value, p.PropertyType);
+                    if (casted == null)
+                    {
+                        NoteSetFldReject(host, name, p.PropertyType, value);
+                        return false;
+                    }
+
+                    value = casted;
+                }
+
                 p.SetValue(host, value);
                 return true;
             }
@@ -2137,7 +2379,18 @@ public static class Diag
             if (mi is System.Reflection.FieldInfo f)
             {
                 if (f.IsInitOnly || f.IsLiteral) return false;
-                if (value != null && !f.FieldType.IsInstanceOfType(value)) return false;
+                if (value != null && !f.FieldType.IsInstanceOfType(value))
+                {
+                    var casted = TryCastToDeclared(value, f.FieldType);
+                    if (casted == null)
+                    {
+                        NoteSetFldReject(host, name, f.FieldType, value);
+                        return false;
+                    }
+
+                    value = casted;
+                }
+
                 f.SetValue(host, value);
                 return true;
             }
@@ -2153,6 +2406,106 @@ public static class Diag
         }
 
         return false;
+    }
+
+    // ═══════════ [SETFLD] 写入被拒的只读诊断 + 拒绝汇总（去重计数，无 cap） ═══════════
+    public static int SetFldRejects, SetFldCasts;
+    private static readonly HashSet<string> SetFldRejectSeen = new();
+
+    /// <summary>把值按**字段声明类型**做指针级转换（Il2CppObjectBase.TryCast&lt;T&gt;）；转不了返回 null。</summary>
+    private static object TryCastToDeclared(object value, Type declared)
+    {
+        try
+        {
+            if (value is not Il2CppObjectBase vb || declared == null) return null;
+            // il2cpp 层可赋值性判定（官方 API）—— 用来说明"托管代理类型退化但 il2cpp 类型其实是兼容的"
+            var vc = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_get_class(vb.Pointer);
+            var dc = NativeClassOf(declared);
+            if (vc == IntPtr.Zero || dc == IntPtr.Zero) return null;
+            if (!Il2CppInterop.Runtime.IL2CPP.il2cpp_class_is_assignable_from(dc, vc)) return null;
+            var m = typeof(Il2CppObjectBase).GetMethod("TryCast");
+            if (m == null) return null;
+            var r = m.MakeGenericMethod(declared).Invoke(vb, null);
+            if (r != null) SetFldCasts++;
+            return r;
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[SETFLD] 指针级转换异常: " + __e.GetType().Name + " " + __e.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// `[SETFLD] 拒绝: <宿主类>.<字段> 声明类型=… 值托管类型=… il2cpp类=… 可转=…`
+    /// —— 只打**首次**出现（去重 ✓），之后只计数 ✓（零 cap ✓、零刷屏 ✓）；结尾有 `拒绝汇总`。
+    /// </summary>
+    private static void NoteSetFldReject(object host, string name, Type declared, object value)
+    {
+        SetFldRejects++;
+        var vType = value?.GetType().FullName ?? "null";
+        var vCls = value is Il2CppObjectBase vb ? AsciiClassName(vb.Pointer) : "-";
+        var key = host.GetType().Name + "." + name + "|声明=" + (declared?.FullName ?? "?") + "|值=" + vType;
+        if (SetFldRejectSeen.Add(key))
+        {
+            MelonLogger.Warning("[SETFLD] 拒绝: " + host.GetType().Name + "." + name
+                                + " 声明类型=" + (declared?.FullName ?? "?")
+                                + " 值托管类型=" + vType
+                                + " il2cpp类=" + vCls
+                                + " 可转=False（il2cpp 层也不可赋值 → 真类型不符）");
+        }
+    }
+
+    /// <summary>`[SETFLD] 拒绝汇总: 共 N 条（按 宿主.字段|声明类型|值类型 去重）` + 逐条 ×次数。</summary>
+    public static void DumpSetFldRejects()
+    {
+        try
+        {
+            MelonLogger.Msg("[SETFLD] 拒绝汇总: 共 " + SetFldRejects + " 次 / 唯一 " + SetFldRejectSeen.Count
+                            + " 种（指针级转换成功=" + SetFldCasts + "）");
+            foreach (var k in SetFldRejectSeen) MelonLogger.Warning("[SETFLD]   " + k);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>记录一次"字段跳过"：按 `类型.字段|原因` 去重 + 计数（首次一行，之后只计数）。</summary>
+    public static void NoteSkipKey(string key)
+    {
+        try
+        {
+            var d = WarpperClassGen.WarpFunc.SkipKeyCounts;
+            if (d.TryGetValue(key, out var n)) d[key] = n + 1;
+            else
+            {
+                d[key] = 1;
+                MelonLogger.Warning("[GSM] 字段跳过(首次): " + key + " — 之后只计数");
+            }
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+    /// <summary>`[GSM] 跳过汇总`：去重 + ×次数（替代原先"逐实例一行"的 95,180 行刷屏；零 cap）。</summary>
+    public static void DumpSkipKeys()
+    {
+        try
+        {
+            var counts = WarpperClassGen.WarpFunc.SkipKeyCounts;
+            var total = 0;
+            foreach (var kv in counts) total += kv.Value;
+            MelonLogger.Msg("[GSM] 字段跳过汇总: 共 " + total + " 次 / 唯一 " + counts.Count + " 种（去重计数，无 cap）"
+                            + "（其中缓存命中=" + StructSkipCacheHits + " 次，只计数不打行）"
+                            + " 耗时=" + ElapsedMs + "ms");
+            foreach (var kv in counts) MelonLogger.Warning("[GSM]   " + kv.Key + " ×" + kv.Value);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
     }
 
     /// <summary>JSON → 托管标量（bool/整型族/浮点/字符串/枚举）。只做**精确**转换，失败即 false（不猜）。</summary>
@@ -2293,6 +2646,7 @@ public static class Diag
                 //   把日志撑爆且掩盖了真根因。现在统一走"**(类型.字段|原因) 去重 + 计数**"
                 //   （= 用户要求の条件筛选：成功只计数、失败去重计数；**不是 cap/截断**）。
                 StructProxyFails++;
+                MarkStructWriteImpossible(host.GetType().Name, fld);   // ★ 结论缓存：同类实例不再重解
                 NoteInlineIssue(host.GetType().Name + "." + fld + "|结构字段无可用成员",
                     "属性与 public 字段都取不到（或只读）→ 该内联结构字段未被赋值");
                 return false;
@@ -2339,7 +2693,8 @@ public static class Diag
 
             // ★ 读回验证（只对**真 il2cpp 对象上的值类型字段**做）：证明值确实进了真对象，
             //   而不是只改了托管副本（后者正是"日志说成功、游戏里没变"的经典假象）。
-            if (memberType is { IsValueType: true } && host is Il2CppObjectBase &&
+            if (ShouldReadbackCheck(host.GetType().Name, fld) &&
+                memberType is { IsValueType: true } && host is Il2CppObjectBase &&
                 TryReadMember(host, fld, out var back, out _, out _, out _))
             {
                 StructReadBackChecks++;
@@ -2497,6 +2852,486 @@ public static class Diag
     /// 并把作者 JSON 里期望的图名一起打出来。
     /// 用途：把"贴图丢了"从截图现象变成可判定的数据（不依赖肉眼、不依赖截图时机）。
     /// </summary>
+    // ═══════════ [WARP-KEY] 键级日志 + 写入后复读（只读判据；成功计数、跳过去重、无 cap） ═══════════
+    public static int WarpKeysProcessed, WarpKeysWritten, WarpKeysSkipped;
+    private static readonly HashSet<string> WarpKeyIssueSeen = new();
+    private static readonly HashSet<string> WarpLoopDoneOld = new();
+    private static readonly HashSet<string> WarpReadbackSeen = new();
+
+    /// <summary>
+    /// 记录一次 `*WarpData` 键的处理结果：成功**只累计计数** ✓；跳过/异常按 `键|结果|原因` **去重** ✓
+    /// 并在首次出现时打一行 ✓（零 cap ✓、零刷屏 ✓）。
+    /// </summary>
+    public static void NoteWarpKey(string key, string host, string shape, string result,
+        int iter = 0, int total = 0)
+    {
+        try
+        {
+            WarpKeysProcessed++;
+            if (result.StartsWith("写入") || result.StartsWith("跳过") || result.StartsWith("异常"))
+            {
+                if (result.StartsWith("写入")) WarpKeysWritten++;
+                else WarpKeysSkipped++;
+
+                // 去重：每个 `宿主|键` 只打一行（无 cap ✓）；行内含**迭代序号 i/总** ✓
+                var kk = host + "|" + key;
+                if (WarpKeyIssueSeen.Add(kk))
+                    MelonLogger.Msg("[WARP-KEY] 迭代 i=" + iter + "/" + total + " 键=" + key + " 宿主=" + host
+                                    + " 形态=" + shape + " 结果=" + result);
+            }
+
+            // ★ [WARP-LOOP] "循环走完"判据：当处理到**最后一个键**时，本行出现 ⇒ 本宿主的键循环完整走完 ✓；
+            //    若某宿主**没有**这行 ⇒ 循环提前退出（配合 `[WARP-LOOP] 提前退出:` 标记定位）✓。
+            if (total > 0 && iter == total && WarpLoopDoneOld.Add(host))
+                MelonLogger.Msg("[WARP-LOOP] 循环结束: 宿主=" + host + " 处理=" + iter + "/总=" + total
+                                + " 最后到达的键=" + key);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>
+    /// **写入后复读**：对 `CardImage` / `CardBackground` 各读一次并打在同一行（每个宿主只打一次 ✓）——
+    /// 用来判定三种情况：键没被处理 ✗ / 写入后被重置 ✗ / 跳过(原因) ✗。
+    /// </summary>
+    public static void NoteWarpFieldReadback(object host, string field, string key)
+    {
+        try
+        {
+            var id = "-";
+            try { id = Member(host, "UniqueID")?.ToString() ?? "-"; } catch { }
+            var g8 = id.Length > 8 ? id.Substring(0, 8) : id;
+            var hostKey = host.GetType().Name + "/" + g8;
+            if (!WarpReadbackSeen.Add(hostKey)) return;   // 每个宿主只打一次（无 cap，仅去重）
+
+            var img = MemberState(host, "CardImage");
+            var bg = MemberState(host, "CardBackground");
+            MelonLogger.Msg("[WARP-KEY] 键=" + key + " 宿主=" + hostKey + " 形态=字符串 结果=写入"
+                            + " 复读: CardImage=" + img + " CardBackground=" + bg);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>`[WARP-LOOP] 提前退出: 宿主=… 位置=… 当前键=… i/总` —— 每个退出点各打一行（去重 ✓）。</summary>
+    public static void NoteWarpLoopExit(string host, string where, string key, int iter, int total)
+    {
+        try
+        {
+            var k = host + "|" + where;
+            if (WarpLoopExitSeen.Add(k))
+                MelonLogger.Warning("[WARP-LOOP] 提前退出: 宿主=" + host + " 位置=" + where
+                                    + " 当前键=" + key + " 迭代 i=" + iter + "/" + total);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    private static readonly HashSet<string> WarpLoopExitSeen = new();
+    // ═══════════ ★ A-3 之 1/2：纯标量类型的快速通道（类型级结论缓存，等价改写、不是 cap） ═══════════
+    private static readonly Dictionary<Type, bool> PureScalarTypeCache = new();
+    public static int FastPathTypes, FastPathInstances, FastPathKeys;
+
+    /// <summary>
+    /// 类型级判定（每类型只算一次）：**该类型的所有成员要么是值类型、要么是 string，且没有
+    /// `*WarpData`/`*WarpType` 成员、没有 List/数组成员** ⇒ 任何 JSON 都只能给它写**标量**。
+    /// 这类类型（`Vector2`/`LocalizedString`/`OptionalRangeValue`…）走完整 warp 机制毫无收益
+    /// （真机 267k+81k+56k 次递归全耗在这里 ✗）→ 用**等价的托管标量写回**代替（结论按类型缓存一次）。
+    /// </summary>
+    public static bool IsPureScalarType(Type t)
+    {
+        try
+        {
+            if (PureScalarTypeCache.TryGetValue(t, out var cached)) return cached;
+            var gen = WarpperClassGen.MainGen.GetOrGen(t);
+            var pure = gen.Count > 0;
+            foreach (var kv in gen)
+            {
+                var n = kv.Key;
+                if (n.EndsWith("WarpData") || n.EndsWith("WarpType")) { pure = false; break; }
+                var ft = kv.Value.fldType;
+                if (ft == null) { pure = false; break; }
+                if (ft.IsGenericType) { pure = false; break; }              // List<…> 等容器
+                if (ft.IsArray) { pure = false; break; }
+                if (kv.Value.isValueType) continue;                          // 值类型成员 ✓
+                if (ft == typeof(string)) continue;                          // 字符串成员 ✓（能直接写）
+                pure = false;                                                // 其它引用成员 → 需要完整 warp
+                break;
+            }
+
+            if (pure) FastPathTypes++;
+            PureScalarTypeCache[t] = pure;
+            return pure;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// **等价快速通道**：纯标量类型 + 该 JSON 全是标量键（无对象/数组/`*WarpType`）⇒ 直接
+    /// "托管标量转换 + `TryWriteMember`"逐键写回，跳过 gen 表/proxy/日志等机制（省掉真机 40 万次递归）。
+    /// 任一条件不满足即返回 false，交回原路径（**行为等价、零信息丢失** ✓）。
+    /// </summary>
+    public static bool TryPureScalarFastPath(object obj, KVProvider json)
+    {
+        try
+        {
+            if (obj == null || json == null || !json.IsObject) return false;
+            if (!IsPureScalarType(obj.GetType())) return false;
+            foreach (var k in json.Keys)
+            {
+                var v = json[k];
+                if (v == null || v.IsObject || v.IsArray) return false;
+                if (k.EndsWith("WarpType") || k.EndsWith("WarpData")) return false;
+            }
+
+            var gen = WarpperClassGen.MainGen.GetOrGen(obj.GetType());
+            FastPathInstances++;
+            foreach (var k in json.Keys)
+            {
+                if (!gen.TryGetValue(k, out var tu)) continue;
+                if (TryConvertScalar(tu.fldType, json[k], out var val) && val != null &&
+                    TryWriteMember(obj, k, val))
+                    FastPathKeys++;
+            }
+
+            return true;
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[FASTPATH] 异常（回退原路径）: " + __e.GetType().Name + " " + __e.Message);
+            return false;
+        }
+    }
+    // ═══════════ ★ A-3 之 3：读回校验降级（首次/ full 才校验，稳态只计数；信息不丢） ═══════════
+    private static readonly HashSet<string> ReadbackChecked = new();
+    public static int ReadbackChecks, ReadbackSkipped, ReadbackMismatch;
+
+    /// <summary>
+    /// 是否还要对 `(类型,字段)` 做"写入后读回校验"：**首次遇到**（或诊断级别 full）做一次 ✓，
+    /// 之后稳态**只计数**（不再付读回成本）✓ —— 不是 cap：`读回不一致` 一旦出现仍会逐条上报 ✓。
+    /// </summary>
+    public static bool ShouldReadbackCheck(string typeName, string fld)
+    {
+        try
+        {
+            if (MiniLoader.DiagFull)
+            {
+                ReadbackChecks++;
+                return true;
+            }
+
+            if (ReadbackChecked.Add(typeName + "." + fld))
+            {
+                ReadbackChecks++;
+                return true;
+            }
+
+            ReadbackSkipped++;
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>`[READBACK] 汇总: 实校验=N 稳态跳过=M 不一致=K`（A-3 收益判据之一）。</summary>
+    public static void DumpReadback()
+    {
+        try
+        {
+            // A-3 收益判据：纯标量快速通道吃掉了多少实例/键
+            MelonLogger.Msg("[FASTPATH] 汇总: 纯标量类型=" + FastPathTypes + " 种 实例=" + FastPathInstances
+                            + " 键=" + FastPathKeys);
+            MelonLogger.Msg("[READBACK] 汇总: 实校验=" + ReadbackChecks + " 稳态跳过=" + ReadbackSkipped
+                            + " 不一致=" + ReadbackMismatch + " 耗时=" + ElapsedMs + "ms");
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+    // ═══════════ ★ [WARP-LOOP] 去重记账：每宿主类首次一行 + 汇总（信息不丢、无 cap） ═══════════
+    public static readonly Dictionary<string, int> WarpLoopDone = new();
+    private static readonly HashSet<string> WarpLoopFirstSeen = new();
+    public static int WarpLoopEarlyExits;
+
+    /// <summary>`[WARP-LOOP] 循环结束(首见宿主类): 宿主=… 处理=i/总=n 最后到达的键=…` + 累计每类次数。</summary>
+    public static void NoteWarpLoopDone(string hostClass, int processed, int total, string lastKey)
+    {
+        try
+        {
+            if (WarpLoopDone.TryGetValue(hostClass, out var n)) WarpLoopDone[hostClass] = n + 1;
+            else WarpLoopDone[hostClass] = 1;
+            if (processed < total) WarpLoopEarlyExits++;
+            if (WarpLoopFirstSeen.Add(hostClass))
+                MelonLogger.Msg("[WARP-LOOP] 循环结束(首见宿主类): 宿主=" + hostClass
+                                + " 处理=" + processed + "/总=" + total + " 最后到达的键=" + lastKey);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>`[WARP-LOOP] 汇总: 宿主类=K 种 实例总数=N 提前退出=M 每类=…`（完整，无 cap）。</summary>
+    public static void DumpWarpLoop()
+    {
+        try
+        {
+            var total = 0;
+            foreach (var kv in WarpLoopDone) total += kv.Value;
+            var parts = new List<string>();
+            foreach (var kv in WarpLoopDone) parts.Add(kv.Key + "(" + kv.Value + ")");
+            MelonLogger.Msg("[WARP-LOOP] 汇总: 宿主类=" + WarpLoopDone.Count + " 种 实例总数=" + total
+                            + " 提前退出=" + WarpLoopEarlyExits + " 耗时=" + ElapsedMs + "ms");
+            MelonLogger.Msg("[WARP-LOOP] 每类次数=[" + string.Join(", ", parts) + "]");
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+    /// <summary>`[WARP-KEY] 汇总: 处理=N 写入=K 跳过=M（唯一跳过原因=U）`。</summary>
+    /// <summary>`[WARP-REF]` 调用后**当场复读** + gen 声明类型（每宿主每字段一行，去重，无 cap）：
+    /// 一眼判定"是没写进去 ✗"还是"写进去后被重置 ✗"。</summary>
+    // ═══════════ ★ 静默 return 显式上报 + 托管成员回退（"解析成功却没写进去"的通解） ═══════════
+    public static int SilentReturns;
+    private static readonly HashSet<string> SilentReturnSeen = new();
+
+    /// <summary>把每一处"静默 return"变成显式上报（首次一行 + 计数，无 cap）：这是挡住我们的那个黑箱。</summary>
+    public static void NoteSilentReturn(string site, string hostType, string fld, string why)
+    {
+        try
+        {
+            SilentReturns++;
+            var k = site + "|" + hostType + "." + fld + "|" + why;
+            if (SilentReturnSeen.Add(k))
+                MelonLogger.Warning("[SILENT] " + site + " 提前返回: " + hostType + "." + fld + " 原因=" + why);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    /// <summary>取托管成员（属性优先→public 字段）的声明类型；取不到返回 null。</summary>
+    public static Type MemberTypeOf(object host, string fld)
+    {
+        try
+        {
+            if (host == null) return null;
+            var t = host.GetType();
+            var p = t.GetProperty(fld); if (p != null) return p.PropertyType;
+            var f = t.GetField(fld); if (f != null) return f.FieldType;
+            return null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// **托管成员回退**：gen 表里没有该字段时，用**托管成员声明类型**解析 JSON 值，再走 `TryWriteMember` 写入。
+    /// —— "解析成功但字段没写进去"的通解；**必须尝试，不许提前返回** ✓。全程托管反射 + 既有安全通道 ✓。
+    /// </summary>
+    public static bool TryResolveAndWriteMember(object host, string fld, string jsonValue)
+    {
+        try
+        {
+            var mt = MemberTypeOf(host, fld);
+            if (mt == null) return false;
+            if (!typeof(Il2CppObjectBase).IsAssignableFrom(mt)) return false;
+            var m = typeof(Diag).GetMethod(nameof(ResolveByJsonForm));
+            if (m == null) return false;
+            var args = new object[] { jsonValue, fld, null };
+            var ok = (bool)m.MakeGenericMethod(mt).Invoke(null, args);
+            if (!ok || args[2] == null) return false;
+            var wrote = TryWriteMember(host, fld, args[2]);
+            if (wrote)
+                MelonLogger.Msg("[SILENT] 托管回退成功写入: " + host.GetType().Name + "." + fld
+                                + " 成员类型=" + mt.Name + " 值=" + jsonValue);
+            return wrote;
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[SILENT] 托管回退异常: " + __e.GetType().Name + " " + __e.Message);
+            return false;
+        }
+    }
+
+    // ═══════════ ★ [OBJID] 对象身份判据 + 写入后"空则回退"（判断"写到了副本上"） ═══════════
+    private static readonly HashSet<string> ObjIdSeen = new();
+
+    /// <summary>`[OBJID] 写/读:<字段> 宿主=0x… 类=… 成员=… 声明类=…` —— 写指针与读指针不一致 ⇒ 写到了副本上。</summary>
+    public static void NoteObjId(string phase, string fld, object host)
+    {
+        try
+        {
+            if (host == null) return;
+            var ptr = 0L;
+            if (host is Il2CppObjectBase b) ptr = b.Pointer.ToInt64();
+            var member = "-"; var declClass = "-";
+            try
+            {
+                var t = host.GetType();
+                var p = t.GetProperty(fld);
+                if (p != null) { member = "属性" + (p.CanWrite ? "(可写)" : "(只读)"); declClass = p.DeclaringType?.Name ?? "-"; }
+                else
+                {
+                    var f = t.GetField(fld);
+                    if (f != null) { member = "字段"; declClass = f.DeclaringType?.Name ?? "-"; }
+                }
+            }
+            catch { }
+            var k = phase + "|" + t0(host) + "|" + fld;
+            if (!ObjIdSeen.Add(k)) return;
+            MelonLogger.Msg("[OBJID] " + phase + ":" + fld + " 宿主=0x" + ptr.ToString("X")
+                            + " 类=" + host.GetType().Name + " 成员=" + member + " 声明类=" + declClass);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    private static string t0(object host) { try { return host.GetType().Name; } catch { return "?"; } }
+
+    /// <summary>引用类字段"写入后是否仍为空"（用于验证式回退）。</summary>
+    public static bool IsNullAfterWrite(object host, string fld)
+    {
+        try { return MemberState(host, fld) == "null" || MemberState(host, fld) == "null(无此成员)"; }
+        catch { return false; }
+    }
+
+    public static void NoteWarpRefReadback(object host, string field, string key, KVProvider json)
+    {
+        try
+        {
+            var id = "-";
+            try { id = Member(host, "UniqueID")?.ToString() ?? "-"; } catch { }
+            var g8 = id.Length > 8 ? id.Substring(0, 8) : id;
+            var hostKey = host.GetType().Name + "/" + g8 + "." + field;
+            if (!WarpRefReadbackSeen.Add(hostKey)) return;
+            var declared = "?";
+            try
+            {
+                var gen = WarpperClassGen.MainGen.GetOrGen(host.GetType());
+                if (gen.TryGetValue(field, out var tu) && tu.fldType != null)
+                    declared = tu.fldType.FullName ?? tu.fldType.Name;
+            }
+            catch { }
+            var after = MemberState(host, field);
+            NoteObjId("读", field, host);
+            MelonLogger.Msg("[WARP-REF] 键=" + key + " 字段=" + field + " 宿主=" + hostKey
+                            + " gen声明类型=" + declared
+                            + " JSON值=" + (json == null ? "?" : json.ToString())
+                            + " 调用后复读=" + after);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[WARP-REF] 失败: " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
+    private static readonly HashSet<string> WarpRefReadbackSeen = new();
+
+    public static void DumpWarpKeys()
+    {
+        try
+        {
+            MelonLogger.Msg("[WARP-KEY] 汇总: 处理=" + WarpKeysProcessed + " 写入=" + WarpKeysWritten
+                            + " 跳过=" + WarpKeysSkipped + "（唯一跳过原因=" + WarpKeyIssueSeen.Count + "）"
+                            + " 耗时=" + ElapsedMs + "ms");
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+    // ═══════════ 名字级证据助手（只读；判定"名字转换错" vs "字段真不存在"） ═══════════
+    /// <summary>取该卡 JSON 里对应字段的**原始键名**（`XxxWarpData` / `Xxx`）。</summary>
+    private static string JsonKeyOf(string cardGuid, string field)
+    {
+        try
+        {
+            if (!ModCardJsonSource.TryGetValue(cardGuid, out var js) || js == null || !js.IsObject)
+                return "(无JSON)";
+            foreach (var k in js.Keys)
+                if (k == field + "WarpData") return k;
+            foreach (var k in js.Keys)
+                if (k == field) return k;
+            return "(JSON 无此键)";
+        }
+        catch
+        {
+            return "(读取异常)";
+        }
+    }
+
+    /// <summary>两侧形态是否一致（对象/数组/标量）—— 不一致时**不做**缺失/未写入判定（防错位比较）。</summary>
+    public static bool SameShape(KVProvider json, object obj)
+    {
+        try
+        {
+            var jObj = json.IsObject;
+            var jArr = json.IsArray;
+            var t = obj.GetType();
+            var oArr = IsIl2CppArrayType(t) || t.IsArray ||
+                       (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Il2CppSystem.Collections.Generic.List<>));
+            var oObj = !oArr && !t.IsPrimitive && t != typeof(string);
+            return (jObj && oObj) || (jArr && oArr) || (!jObj && !jArr && !oObj);
+        }
+        catch
+        {
+            return true;   // 判不了就不下结论
+        }
+    }
+
+    /// <summary>对象的形态名（对象/数组(N)/标量）。</summary>
+    public static string ObjShape(object obj)
+    {
+        try
+        {
+            var t = obj.GetType();
+            if (IsIl2CppArrayType(t) || t.IsArray ||
+                (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Il2CppSystem.Collections.Generic.List<>)))
+                return "数组(" + ElemCount(obj) + ")";
+            if (!t.IsPrimitive && t != typeof(string)) return "对象";
+            return "标量(" + t.Name + ")";
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+    /// <summary>成员查找结果（属性/字段/gen表/都没有 + 是否内联值类型）——“它到底在找哪个名字、在哪一层找”。</summary>
+    public static string MemberKind(object host, string name)
+    {
+        try
+        {
+            var t = host.GetType();
+            var p = t.GetProperty(name);
+            if (p != null) return "属性" + (p.CanWrite ? "(可写)" : "(只读)");
+            var f = t.GetField(name);
+            if (f != null) return "字段" + (f.IsInitOnly ? "(只读)" : "");
+            var gen = WarpperClassGen.MainGen.GetOrGen(t);
+            if (gen.TryGetValue(name, out var tu)) return "gen表有(值类型=" + tu.isValueType + ")";
+            return "都没有";
+        }
+        catch
+        {
+            return "查找异常";
+        }
+    }
+
     public static void DumpModCardImages()
     {
         try
@@ -2526,6 +3361,17 @@ public static class Diag
                 catch (Exception __e) { MelonLogger.Warning("[Diag] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
 
                 var id = kv.Key.Length > 8 ? kv.Key.Substring(0, 8) : kv.Key;
+
+                // ★★ [2026-10-03 名字级证据] 三列并排：① JSON 原始键名 ② 用于查找的字段名 ③ 目标对象类名
+                //    —— `CardImage`（写不进）与 `CardBackground`（写得进）**都是名字形态的 Sprite 引用** ✗，
+                //    所以只有把两者的 ①②③ 并排打出来，才能判断是"名字转换错"还是"字段真不存在"。
+                var k1 = JsonKeyOf(kv.Key, "CardImage");
+                var k2 = JsonKeyOf(kv.Key, "CardBackground");
+                lines.Add("[CARDIMG3] " + id + " ①JSON键: CardImage→" + k1 + " / CardBackground→" + k2
+                          + " ②查找字段名: CardImage / CardBackground"
+                          + " ③目标类=" + ro.GetType().Name + "（成员查找: CardImage=" + MemberKind(ro, "CardImage")
+                          + " CardBackground=" + MemberKind(ro, "CardBackground") + "）"
+                          + " 值形态: " + imgState + " / " + bgState);
                 lines.Add("[CARDIMG] " + id + " 托管类=" + ro.GetType().Name + " CardImage=" + imgState
                           + " CardBackground=" + bgState + " 期望图=" + want);
             }
@@ -2655,6 +3501,120 @@ public static class Diag
     /// ReceivingCardChanges.TransformInto` + 空引用计数 → 一眼定案"引用有没有解出来"。
     /// 只 dump **mod 自己创建的卡**（默认名字含 Windy / 精灵，或 CardInteractions 非空的前 2 张）。
     /// </summary>
+    // ═══════════ ★ [DRAG-BISECT] 诊断性二分开关（默认"不限"= 不改变任何默认行为；定位完成后删除） ═══════════
+    /// <summary>
+    /// 从 MelonPreferences.cfg 读 `Diag_DragInteractionsMax`（**默认 0 = 不限**）。
+    /// 仅在显式设置 &gt;0 时生效：把 mod 卡的 `CardInteractions` 裁剪到前 N 条，用于**诊断二分**
+    /// （37 条按 8/16/24/32 逐档试，锁定"从第几条开始卡"）。这是诊断工具，不是最终方案。
+    /// </summary>
+    public static int DragInteractionsMax()
+    {
+        try
+        {
+            var raw = MiniLoader.PrefFileRaw("Diag_DragInteractionsMax");
+            if (string.IsNullOrEmpty(raw)) return 0;
+            raw = raw.Trim().Trim('"');
+            if (int.TryParse(raw, out var n) && n > 0) return n;
+            return 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>按开关裁剪 mod 卡的 CardInteractions（默认不限 → 本函数零动作）。</summary>
+    public static void ApplyDragBisect()
+    {
+        var max = DragInteractionsMax();
+        MelonLogger.Msg("[DRAG-BISECT] 交互上限=" + (max > 0 ? max.ToString() : "不限（默认）"));
+        if (max <= 0) return;   // 默认零动作 ✓
+        try
+        {
+            var dict = MiniLoader.ItemDictionary(typeof(CardData));
+            int scanned = 0, withCi = 0, over = 0, trimmed = 0;
+            foreach (var kv in dict)
+            {
+                scanned++;
+                object ro = null;
+                try { ro = Retype(kv.Value) ?? kv.Value; } catch { }
+                if (ro == null) continue;
+                var ci = Member(ro, "CardInteractions");
+                var n = (int)ElemCount(ci);
+                if (n <= 0) continue;
+                withCi++;
+                if (n <= max) continue;
+                over++;
+                var nm = NameOf(ro) ?? kv.Key;
+
+                // ★ `CardInteractions` 是**数组**（Il2CppReferenceArray<CardOnCardAction>），没有 RemoveAt ✗
+                //   ⇒ 造一个长度 N 的新数组，把原数组前 N 个元素逐个赋进去，再整块写回属性（纯托管 ✓）。
+                var t = ci.GetType();
+                var ctor = t.GetConstructor(new[] { typeof(int) });
+                var itemProp = t.GetProperty("Item");
+                if (ctor == null || itemProp == null)
+                {
+                    MelonLogger.Warning("[DRAG-BISECT] 裁剪失败（数组类型缺 ctor(int)/索引器）: " + t.Name
+                                        + " ctor=" + (ctor != null) + " item=" + (itemProp != null));
+                    continue;
+                }
+
+                var newArr = ctor.Invoke(new object[] { max });
+                for (var i = 0; i < max; i++)
+                    itemProp.SetValue(newArr, GetElem(ci, i), new object[] { i });
+
+                if (!TryWriteMember(ro, "CardInteractions", newArr))
+                {
+                    MelonLogger.Warning("[DRAG-BISECT] 裁剪写回失败: " + nm + ".CardInteractions（属性/字段都写不进）");
+                    continue;
+                }
+
+                // ★ 复读验证：只有确认"真的变成 N 项"才计成功（不许假成功 ✗）
+                var after = (int)ElemCount(Member(ro, "CardInteractions"));
+                if (after != max)
+                {
+                    MelonLogger.Warning("[DRAG-BISECT] 裁剪后复读不符: " + nm + ".CardInteractions = " + after
+                                        + " 项（期望 " + max + "）→ 不计成功");
+                    continue;
+                }
+
+                // ★ 内容验证（不只验长度 ✗）：逐元素打印"原数组前 N / 新数组前 N"并比对 ——
+                //   判定 null / 重复 / 类型不对 / Item 索引器写进副本（真机疑似根因）。
+                {
+                    var same = 0;
+                    for (var i = 0; i < max; i++)
+                    {
+                        var o0 = GetElem(ci, i);
+                        var o1 = GetElem(Member(ro, "CardInteractions"), i);
+                        var p0 = PtrOf(o0);
+                        var p1 = PtrOf(o1);
+                        var eq = (o0 != null && o1 != null && p0 != 0 && p0 == p1);
+                        if (eq) same++;
+                        MelonLogger.Msg("[DRAG-BISECT] " + nm + " 裁剪后[" + i + "]: 原="
+                                        + (o0 == null ? "null" : o0.GetType().Name + " 0x" + p0.ToString("X") + " " + ActionNm(o0))
+                                        + " | 新="
+                                        + (o1 == null ? "null" : o1.GetType().Name + " 0x" + p1.ToString("X") + " " + ActionNm(o1))
+                                        + (eq ? " 一致" : " ★不一致"));
+                    }
+
+                    MelonLogger.Msg("[DRAG-BISECT] 内容比对: " + nm + " 一致=" + same + "/" + max
+                                    + (same == max ? "（元素与原数组一一对应）" : "（★ 写入落到副本/元素不干净）"));
+                }
+
+                trimmed++;
+                MelonLogger.Warning("[DRAG-BISECT] 已裁剪 " + nm + " 的 CardInteractions: " + n + " → " + max + " 条（诊断用）");
+                MelonLogger.Msg("[DRAG-BISECT] 裁剪后复读: " + nm + ".CardInteractions = " + after + " 项");
+            }
+
+            MelonLogger.Msg("[DRAG-BISECT] 扫描: 卡=" + scanned + " 含交互=" + withCi + " 超出上限=" + over
+                            + " 已裁剪=" + trimmed + " 上限=" + max);
+        }
+        catch (Exception __e)
+        {
+            MelonLogger.Warning("[DRAG-BISECT] 裁剪失败: " + __e.GetType().Name + " " + __e.Message);
+        }
+    }
+
     public static void DumpModCardInteractions()
     {
         try
@@ -2670,13 +3630,14 @@ public static class Diag
                 var ci = Member(cd, "CardInteractions");
                 var n = (int)ElemCount(ci);
 
-                // [2026-10-03 通用化·修正] **选取规则 = 所有含非空 CardInteractions 的 mod 卡，不设数量上限**。
-                // （上一版用"前 N 张"当筛选 → 把排在后面的卡整个漏掉 ✗；数量上限只用于**日志长度保护** ✓，
+                // [2026-10-03 通用化·修正] **选取规则 = 所有含非空 CardInteractions 的 mod 卡，不设数量上限** ✓
+                //（上一版用"前 N 张"当筛选 → 把排在后面的卡整个漏掉 ✗；**不设 cap、不截断** ✓）
                 if (n <= 0) continue;
                 dumped++;
-                {
-                    continue;
-                }
+                // ⛔ [2026-10-03 修复] 这里原来是一段**无条件 `{ continue; }`** ✗（"删 cap"脚本留下的半截代码 ✗）——
+                //   它让**所有**逐卡 header 与逐项明细永远打不出来（真机：`CardInteractions: 共` = 0 行 ✗、
+                //   `[MODCARD] [i]` = 0 行 ✗，只剩通用汇总 ✓）。诊断"交互字段齐不齐"全靠这几行，必须打通 ✓。
+                //   成功只计数 ✓、失败/异常逐条 ✓、**无 cap** ✓。
                 var emptyCompat = 0;
                 var emptyAction = 0;
                 var keywordHit = 0;
@@ -4184,18 +5145,32 @@ public static class Diag
                     if (got == 0)
                     {
                         DiffMismatch++;
-                        Report("字段=" + label + "." + fld + " JSON=" + want + " 项 对象=0 项（引用未写入）");
+                        Report("字段=" + label + "." + fld + " JSON=" + want + " 项 对象=0 项（引用未写入）"
+                               + " | ①JSON键=" + k + " ②查找名=" + fld + " ③当前对象类=" + obj.GetType().Name
+                               + " 查找层级: " + label + "（成员=" + MemberKind(obj, fld) + "）");
                     }
 
                     continue;
                 }
 
                 var ov = Member(obj, k);
+
+                // ★ [错位修复] 只有两侧**同形态**才做缺失/未写入判定；形态不同只报一行（不再误导）。
+                if (ov != null && !SameShape(jv, ov))
+                {
+                    DiffChecked++;
+                    Report("字段=" + label + "." + k + " 形态不同(JSON=" + Kind(jv) + " 对象=" + ObjShape(ov)
+                           + ") — 不做缺失判定 | ①JSON键=" + k + " ②查找名=" + k + " ③当前对象类=" + obj.GetType().Name);
+                    continue;
+                }
+
                 if (ov == null)
                 {
                     DiffChecked++;
                     DiffMismatch++;
-                    Report("字段=" + label + "." + k + " JSON=" + Kind(jv) + " 对象=null（字段缺失）");
+                    Report("字段=" + label + "." + k + " JSON=" + Kind(jv) + " 对象=null（字段缺失）"
+                           + " | ①JSON键=" + k + " ②查找名=" + k + " ③当前对象类=" + obj.GetType().Name
+                           + " 查找层级: " + label + "（成员=" + MemberKind(obj, k) + "）");
                     continue;
                 }
 
@@ -4477,4 +5452,165 @@ public static class Diag
 
         return idx;
     }
+
+    // ═══════════ ★ [DRAG-CALLER] 打转那段游戏代码点名（去重计数，不刷屏） ═══════════
+    private static readonly Dictionary<string, int> DragCallers = new();
+    private static readonly Dictionary<string, int> DragFingerprints = new();
+
+    public static void NoteDragCaller(string caller)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(caller)) return;
+            if (DragCallers.TryGetValue(caller, out var n)) DragCallers[caller] = n + 1;
+            else { DragCallers[caller] = 1; MelonLogger.Warning("[DRAG-CALLER] 首次出现 调用者=" + caller); }
+        }
+        catch { }
+    }
+
+    public static void NoteDragFingerprint(object trigger)
+    {
+        try
+        {
+            if (trigger == null) return;
+            object ro = trigger;
+            try { ro = Retype(trigger) ?? trigger; } catch { }
+            var cc = Member(ro, "CompatibleCards");
+            // ★ 结构体 + 数组字段 ⇒ **按字段读**（`ldflda` 语义：先取字段值本身，不做属性/装箱往返），
+            //   否则拿不到真数组（哨兵 -1）。TriggerCards/TriggerTags 在 Mono 侧就是 `CardData[]`/`CardTag[]` 字段。
+            var tc = -1; var tt = -1;
+            try
+            {
+                var ccType = cc?.GetType();
+                var f1 = ccType?.GetField("TriggerCards");
+                var f2 = ccType?.GetField("TriggerTags");
+                var v1 = f1?.GetValue(cc);
+                var v2 = f2?.GetValue(cc);
+                tc = v1 == null ? 0 : (int)ElemCount(v1);
+                tt = v2 == null ? 0 : (int)ElemCount(v2);
+            }
+            catch (Exception __e)
+            {
+                MelonLogger.Warning("[DRAG-CALLER] 结构字段读取失败: " + __e.GetType().Name + " " + __e.Message);
+            }
+            var key = "TriggerCards=" + tc + " TriggerTags=" + tt;
+            if (DragFingerprints.TryGetValue(key, out var n)) DragFingerprints[key] = n + 1;
+            else
+            {
+                DragFingerprints[key] = 1;
+                MelonLogger.Warning("[DRAG-CALLER] 触发条件指纹: " + key
+                                    + (tc == 0 && tt == 0 ? "  ★★ 两者都为 0（跟谁都匹配）" : ""));
+            }
+        }
+        catch { }
+    }
+
+    public static void DumpDragCallers()
+    {
+        try
+        {
+            MelonLogger.Msg("[DRAG-CALLER] 调用者汇总: 唯一=" + DragCallers.Count);
+            foreach (var kv in DragCallers) MelonLogger.Warning("[DRAG-CALLER]   " + kv.Key + " ×" + kv.Value);
+            MelonLogger.Msg("[DRAG-CALLER] 触发条件指纹汇总: 唯一=" + DragFingerprints.Count);
+            foreach (var kv in DragFingerprints) MelonLogger.Warning("[DRAG-CALLER]   " + kv.Key + " ×" + kv.Value);
+        }
+        catch { }
+    }
+
+
+    // ═══════════ ★ [DRAG-COST] 拖拽工作量计数（"算不完" vs "死锁"的判别器） ═══════════
+    public static int ValidTriggerCalls;
+    private static readonly System.Diagnostics.Stopwatch DragCostSw = new();
+    private static long _costT0;
+
+    /// <summary>每次进入 IsValidTrigger 记一次（计数 + 起表）。上万次 ⇒ "算不完"的铁证。</summary>
+    public static void NoteValidTrigger()
+    {
+        try
+        {
+            ValidTriggerCalls++;
+            if (!DragCostSw.IsRunning) { DragCostSw.Restart(); _costT0 = Environment.TickCount64; }
+        }
+        catch { }
+    }
+
+    /// <summary>[DRAG-COST] 本轮拖拽: IsValidTrigger 调用=N 次 耗时=Xms（只在停顿/拖拽结束时打一行）。</summary>
+    public static void DumpDragCost(string reason, int interactions, int boardCandidates)
+    {
+        try
+        {
+            var ms = DragCostSw.IsRunning ? DragCostSw.ElapsedMilliseconds : 0;
+            var wall = _costT0 == 0 ? 0 : Environment.TickCount64 - _costT0;
+            MelonLogger.Warning("[DRAG-COST] " + reason + ": IsValidTrigger 调用=" + ValidTriggerCalls
+                                + " 次 累计耗时=" + ms + "ms 墙钟=" + wall + "ms"
+                                + " | 涉及交互条目=" + interactions + " 盘面候选卡=" + boardCandidates
+                                + (ValidTriggerCalls >= 10000 ? "  ★★ 上万次 ⇒ 算不完（性能问题）" : ""));
+        }
+        catch { }
+    }
+
+    /// <summary>拖拽结束：汇总 + 复位（下一轮拖拽重新计数）。</summary>
+    public static void EndDragCost(string reason, int interactions, int boardCandidates)
+    {
+        try
+        {
+            DumpDragCost(reason, interactions, boardCandidates);
+            DragCostSw.Reset();
+            _costT0 = 0;
+            ValidTriggerCalls = 0;
+        }
+        catch { }
+    }
+
+
+    // ═══════════ ★ [MODCARD-DEFAULT] 与"游戏原生同类条目"并排对比（JSON 缺省字段的头号嫌疑） ═══════════
+    public static void DumpModCardDefaults()
+    {
+        try
+        {
+            var dict = MiniLoader.ItemDictionary(typeof(CardData));
+            object vanillaEntry = null, modEntry = null;
+            string vanillaName = null, modName = null;
+            foreach (var kv in dict)
+            {
+                object ro = null;
+                try { ro = Retype(kv.Value) ?? kv.Value; } catch { }
+                if (ro == null) continue;
+                var ci = Member(ro, "CardInteractions");
+                if ((int)ElemCount(ci) <= 0) continue;
+                var isMod = ModCardJsonSource.ContainsKey(kv.Key);
+                if (!isMod && vanillaEntry == null) { vanillaEntry = Retype(GetElem(ci, 0)) ?? GetElem(ci, 0); vanillaName = NameOf(ro) ?? kv.Key; }
+                if (isMod && modEntry == null) { modEntry = Retype(GetElem(ci, 0)) ?? GetElem(ci, 0); modName = NameOf(ro) ?? kv.Key; }
+                if (vanillaEntry != null && modEntry != null) break;
+            }
+
+            if (vanillaEntry == null || modEntry == null)
+            {
+                MelonLogger.Warning("[MODCARD-DEFAULT] 对比失败: 原版条目=" + (vanillaEntry != null)
+                                    + " 我们的条目=" + (modEntry != null));
+                return;
+            }
+
+            foreach (var f in new[] { "WorksBothWays", "CarryOverGivenCard" })
+            {
+                var a = "-"; var b = "-";
+                try
+                {
+                    var va = Member(vanillaEntry, f);
+                    var vb = Member(modEntry, f);
+                    a = va?.ToString() ?? "null";
+                    b = vb?.ToString() ?? "null";
+                }
+                catch (Exception __e) { MelonLogger.Warning("[MODCARD-DEFAULT] 读字段失败 " + f + ": " + __e.Message); }
+                MelonLogger.Msg("[MODCARD-DEFAULT] 字段=" + f + "  原版条目(" + vanillaName + ")=" + a
+                                + "  我们的条目(" + modName + ")=" + b + (a != b ? "   ★不一致" : "  一致"));
+            }
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[MODCARD-DEFAULT] 失败: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
 }
+

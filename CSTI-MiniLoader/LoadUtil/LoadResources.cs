@@ -161,6 +161,40 @@ public static class LoadResources
                 warped++;
                 WarpFunc.JsonCommonWarpper(processingScriptableObjectPack.Obj, json);
 
+                // ★★ [WARP-JSONKEYS] 只读判据：**这个宿主实际拿到的 JSON 键清单**（去重每宿主一次、无 cap）。
+                //    用来回答"`CardImageWarpData` 到底在不在我们手里的 JSON 里"——
+                //    在 ⇒ 遍历/过滤把它丢了；不在 ⇒ 我们手里的 JSON 不是完整卡数据。
+                //    同时列出"JSON 里有、gen 表里没有"的键（可能直接指向键名规范化那一步）。
+                try
+                {
+                    var hostObj = processingScriptableObjectPack.Obj;
+                    var gid = "-";
+                    try { gid = Diag.Member(hostObj, "UniqueID")?.ToString() ?? "-"; } catch (Exception __e) { MelonLogger.Warning("[LoadResources] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
+                    var g8 = gid.Length > 8 ? gid.Substring(0, 8) : gid;
+                    var hostKey = Diag.Cls(hostObj) + "/" + g8;
+                    if (JsonKeysLogged.Add(hostKey))
+                    {
+                        var gen = WarpperClassGen.MainGen.GetOrGen(hostObj.GetType());
+                        var missing = new List<string>();
+                        foreach (var k in json.Keys)
+                        {
+                            var fld = k.EndsWith("WarpType") ? k.Substring(0, k.Length - 8) : k;
+                            if (!gen.ContainsKey(fld)) missing.Add(k);
+                        }
+
+                        MelonLogger.Msg("[WARP-JSONKEYS] 宿主=" + hostKey + " 键数=" + json.Count
+                                        + " 含CardImageWarpData=" + json.ContainsKey("CardImageWarpData")
+                                        + " 含CardImage=" + json.ContainsKey("CardImage")
+                                        + " 全部键=[" + string.Join(",", json.Keys) + "]");
+                        MelonLogger.Msg("[WARP-JSONKEYS] 宿主=" + hostKey + " JSON有但gen表没有(" + missing.Count
+                                        + ")=[" + string.Join(",", missing) + "]");
+                    }
+                }
+                catch (Exception __e)
+                {
+                    MelonLogger.Warning("[WARP-JSONKEYS] 失败: " + __e.GetType().Name + " " + __e.Message);
+                }
+
                 // 每种类型只打一次：json 字段数 vs 生成器字段数（gen=0 说明 warp 会把所有键静默跳过）
                 var tname = Diag.Cls(processingScriptableObjectPack.Obj);
                 if (loggedTypes.Add(tname))
@@ -388,6 +422,9 @@ public static class LoadResources
 
 
     /// <summary>GSM 逐条判据的计数（本轮已处理条数 / 预期总条数，来自离线解包：63 条）。</summary>
+    /// <summary>[WARP-JSONKEYS] 每宿主只打一次（去重，无 cap）。</summary>
+    private static readonly HashSet<string> JsonKeysLogged = new();
+
     private static int GsmSeen;
     private const int GsmTotalExpected = 63;
 

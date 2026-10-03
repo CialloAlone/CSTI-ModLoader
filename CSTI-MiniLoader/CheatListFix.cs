@@ -31,14 +31,24 @@ namespace CSTI_MiniLoader
     {
         private static int _tick;
         private static int _fillTries;
-        private static int _lastFillMs = -100000;
         private static int _errLogged;
         private static int _lastA = -1;
         private static int _lastB = -1;
 
+        // ★★ [2026-10-03 卡死修复] "重建检测"状态：只有**表真的被重建过**才补一次。
+        //    · 上一次看到的 长度 + 首元素指针 + 末元素指针
+        //    · 已经补过的"表指纹"（补过就不再重复调用 → 天然不会每帧刷 FillCards）
+        //    · 自上次补以来跳过的帧数（用于证明"大部分帧是跳过"）
+        private static int _seenLen = -1;
+        private static IntPtr _seenFirst, _seenLast;
+        private static string _filledFp;
+        private static int _skippedFrames;
+
         /// <summary>
-        /// 由 HookFree.Tick **每帧**调用。[掩盖审计 P4] 事件驱动：不再"每 4 秒轮询 + 20 秒冷却"，
-        /// 而是每帧比对 `AllCards` 的长度/首元素 —— 游戏一重建该表，下一次 Tick 立刻补回。
+        /// 由 HookFree.Tick **每帧**调用。**事件驱动且零调用**：每帧只做一次廉价的"指纹比对"
+        /// （长度 + 首元素指针 + 末元素指针）；**只有指纹变化（= 游戏重建过该表）才补一次**，
+        /// 且同一张表**只补一次**。其余帧直接返回，**不调用任何游戏方法**。
+        /// （旧实现"命中=0 就补"会在某些状态下每帧调 `FillCards()` → 主线程被拖死 → 拖拽卡死 ✗。）
         /// </summary>
         public static void Tick()
         {
@@ -55,6 +65,35 @@ namespace CSTI_MiniLoader
             }
         }
 
+        /// <summary>表指纹：长度 + 首元素指针 + 末元素指针（任何一项变化 = 游戏重建过该表）。</summary>
+        private static string Fingerprint(object list, out int len, out IntPtr first, out IntPtr last)
+        {
+            len = 0;
+            first = IntPtr.Zero;
+            last = IntPtr.Zero;
+            try
+            {
+                if (list == null) return "<null>";
+                len = Count(list);
+                if (len > 0)
+                {
+                    var e0 = Elem(list, 0);
+                    var e1 = Elem(list, len - 1);
+                    if (e0 is Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase b0)
+                        first = b0.Pointer;
+                    if (e1 is Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase b1)
+                        last = b1.Pointer;
+                }
+
+                return len + ":" + first.ToInt64().ToString("X") + ":" + last.ToInt64().ToString("X");
+            }
+            catch (Exception __e)
+            {
+                MelonLogger.Warning("[CheatListFix] 异常(已记录): " + __e.GetType().Name + " " + __e.Message);
+                return "<err>";
+            }
+        }
+
         private static void RunOnce()
         {
             var cm = Pump.CheatsInstance;
@@ -65,19 +104,40 @@ namespace CSTI_MiniLoader
 
             var modNames = ModCardNames();
 
+            // ★★ [卡死修复 ①] 指纹比对（廉价、无游戏调用）：长度 + 首元素指针 + 末元素指针。
+            //    与上一次完全相同 → **本帧直接返回，零调用**（这就是"大部分帧是跳过"的证据）。
+            var listA = GetMember(cm, "AllCards");
+            var fp = Fingerprint(listA, out var len, out var first, out var last);
+            if (len == _seenLen && first == _seenFirst && last == _seenLast)
+            {
+                _skippedFrames++;
+                return;
+            }
+
+            var lenFrom = _seenLen;
+            _seenLen = len;
+            _seenFirst = first;
+            _seenLast = last;
+
             var a = Report("CheatsManager.AllCards", cm, modNames, ref _lastA);
             if (gm != null) Report("GameManager.AllCards", gm, modNames, ref _lastB);
 
-            // ② mod 卡一张都没命中 → 让游戏自己重填一次（它内部会走游戏的卡库）
-            //    [掩盖审计 P4] 事件驱动：命中=0 就补，**没有固定冷却** —— 游戏在进档/开界面重建该表后，
-            //    下一次 Tick（每帧）就会把 mod 卡补回去；不再用"等 20 秒"来掩盖"不知道它何时重建"。
+            // ★★ [卡死修复 ②] 同一张表**只补一次**：补过的指纹记下来，之后即使指纹再相同也不会重复调用。
             if (a == 0 && MiniLoader.CheatListsTriggerFill)
             {
+                if (fp == _filledFp) return;   // 这张表已经补过了 → 不重复调用（零调用）
+
                 _fillTries++;
                 var ok = Invoke(cm, "FillCards");
                 var after = Report("触发 FillCards 后 CheatsManager.AllCards", cm, modNames, ref _lastA, force: true);
-                MelonLogger.Msg("[CHEATLIST] 命中=0 → 立刻补（第 " + _fillTries + " 次）: 调用成功=" + ok
-                                + "；mod 卡命中 " + a + " → " + after);
+                var fpAfter = Fingerprint(GetMember(cm, "AllCards"), out _, out _, out _);
+                _filledFp = fpAfter;
+                MelonLogger.Msg("[CHEATLIST] 重建检测: 长度 " + lenFrom + "→" + len
+                                + " 首元素 0x" + first.ToInt64().ToString("X")
+                                + " 末元素 0x" + last.ToInt64().ToString("X")
+                                + " → 触发补一次（第 " + _fillTries + " 次，调用成功=" + ok
+                                + "；mod 卡命中 " + a + " → " + after
+                                + "；自上次补以来跳过帧数=" + _skippedFrames + "）");
             }
         }
 

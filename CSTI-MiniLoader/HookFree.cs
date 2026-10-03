@@ -59,6 +59,7 @@ namespace CSTI_MiniLoader
 
         public static void Tick()
         {
+            Diag.Heartbeat();   // ★ 主线程停顿心跳（只在 >500ms 不推进时打一行）
             try
             {
                 if (!_probed) { _probed = true; ProbeFindApis(); }

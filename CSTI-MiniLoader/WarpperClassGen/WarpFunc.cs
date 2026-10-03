@@ -26,7 +26,9 @@ public static class WarpFunc
     private static readonly System.Collections.Generic.List<string> StatExSample = new();
     private static readonly System.Collections.Generic.List<string> StatSkipSample = new();
     /// <summary>「字段不在 gen 表」的采样（无条件记录，上限 30）—— 空字段问题的直接证据。</summary>
-    public static readonly System.Collections.Generic.List<string> SkipKeySamples = new();
+    // [2026-10-03] 逐实例列表 → **去重 + 计数**（真机 95,180 行刷屏就是这里：删 cap 后它无上限增长 ✗）。
+    //   用户口径：按条件筛（去重键 + ×次数），不是 cap；失败/跳过必须可见但不刷屏。
+    public static readonly System.Collections.Generic.Dictionary<string, int> SkipKeyCounts = new();
     /// <summary>内联值类型直写的日志条数上限（避免刷屏）。</summary>
     public static int InlineLogged;
 
@@ -71,6 +73,9 @@ public static class WarpFunc
     {
         if (!json.IsObject) return;
         if (obj == null) return;
+        // ★★ [A-3 快速通道] 纯标量类型（Vector2/LocalizedString/OptionalRangeValue…）直接托管标量写回，
+        //    跳过完整 warp 机制（真机 40 万次递归耗在这里 ✗）。行为等价、零信息丢失 ✓，条件不满足即走原路径 ✓。
+        if (Diag.TryPureScalarFastPath(obj, json)) return;
 
         // ★★ [2026-10-03 GSM 关键修复] 目标对象常常是**游戏自带对象**，Il2CppInterop 把注册表里的
         //    游戏对象统一包成基类 `UniqueIDScriptable` → `obj.GetType()` 是基类 →
@@ -106,8 +111,21 @@ public static class WarpFunc
             StatSkipSample.Add("gen 表为空（该类型没有任何 NativeFieldInfoPtr 字段）: " + objType.FullName);
         }
 
-        foreach (var key in json.Keys)
+        // ★★ [2026-10-03 两遍处理] 引用类字段的最终写入顺序：**先普通键（含 Unity 占位）→ 后 `*WarpData` 解析值**。
+        //    真机证据：`CardImage` 键被遍历 ✓、`CommonSet` 被调用 ✓、无跳过/异常 ✓，但最终仍 null ✗，
+        //    同形态的 `CardBackground` 成功 ✓ ⇒ 最可能是**占位/普通键在收尾阶段又写了空值** ✗。
+        //    两遍处理让"解析出来的真实引用"**最后落盘**，覆盖 `CardImage`/`CardTags`/`WhenCreatedSounds`/
+        //    `GivenCardChanges.TransformInto` 等同症状字段（通用规则，不按字段名/卡名特判 ✓）。
+        var __keys = new System.Collections.Generic.List<string>();
+        foreach (var __k in json.Keys) __keys.Add(__k);
+        var __total = __keys.Count;
+        var __i = 0; var __last = "-";
+        for (var __pass = 0; __pass < 2; __pass++)
+        foreach (var key in __keys)
         {
+            var __isWarpKey = key.EndsWith("WarpData") || key.EndsWith("WarpType");
+            if ((__pass == 0) == __isWarpKey) continue;   // pass0=普通键；pass1=*WarpData/*WarpType
+            __i++; __last = key;
             StatKeys++;
             try
             {
@@ -134,12 +152,28 @@ public static class WarpFunc
                     if (!genInfos.TryGetValue(fieldName, out var tuple))
                     {
                         StatSkipped++;
-                        SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
+                        Diag.NoteSkipKey(objType.Name + "." + fieldName + "|gen表无此字段");
+                        Diag.NoteWarpKey(fieldName + "WarpData", objType.Name, "字符串", "跳过(gen表无此字段)", __i, __total);
                         StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
                         continue;
                     }
                     var fieldWarpData = json[fieldName + "WarpData"];
-                    MainGenTools.CommonSet((Il2CppObjectBase)obj, fieldName, fieldWarpData, (WarpType)keyData.Int);
+                    // ★ [WARP-KEY] 键级判据：处理后记"写入"；对 CardImage/CardBackground 再做**写入后复读**
+                    //   （成功只累计计数 ✓、跳过/异常按 键|结果 去重首次一行 ✓、无 cap ✓）
+                    try
+                    {
+                        var shape = fieldWarpData.IsArray ? ("数组(" + fieldWarpData.Count + ")")
+                            : fieldWarpData.IsObject ? "对象" : fieldWarpData.IsString ? "字符串" : "其它";
+                        MainGenTools.CommonSet((Il2CppObjectBase)obj, fieldName, fieldWarpData, (WarpType)keyData.Int);
+                        Diag.NoteWarpKey(key, objType.Name, shape, "写入", __i, __total);
+                        if (fieldName is "CardImage" or "CardBackground")
+                            Diag.NoteWarpRefReadback(obj, fieldName, key, fieldWarpData);
+                    }
+                    catch (Exception wke)
+                    {
+                        Diag.NoteWarpKey(key, objType.Name, "?", "异常(" + wke.GetType().Name + " " + wke.Message + ")", __i, __total);
+                    }
+
                     StatSet++;
                 }
                 else if (key.EndsWith("WarpData"))
@@ -156,7 +190,7 @@ public static class WarpFunc
                             StatSkipped++;
                             if (MiniLoader.DiagFull && fieldName is "DroppedCard" or "ActionName" or "ProducedCards")
                                 MelonLogger.Msg("[CHAIN]   ↳ 字段不在 gen 表: " + objType.Name + "." + fieldName);
-                            SkipKeySamples.Add(objType.Name + "." + fieldName + "（gen表无此字段）");
+                            Diag.NoteSkipKey(objType.Name + "." + fieldName + "|gen表无此字段");
                             StatSkipSample.Add("字段未生成: " + objType.Name + "." + fieldName);
                             continue;
                         }
@@ -176,7 +210,14 @@ public static class WarpFunc
                             //    全程托管属性 setter：**不用字段偏移、不做 memcpy、不写裸内存**。
                             //    真机证据：mod 卡 `Windy.CardInteractions` 37 项 TriggerCards/TriggerTags 全空
                             //    → 用户"纤维/蛇草拖不到精灵身上"。
-                            if (MiniLoader.StructSetterFix && Diag.TrySetStructViaProxy(obj, fieldName, keyData))
+                               // ★★ [跳过结论缓存] 同一 (宿主类型,字段) 已判定写不进 → 直接跳过，不再重解
+                               //    （真机 95,192 次跳过里绝大多数是同一道题；首次仍逐条打印、唯一原因全量保留、汇总计数不变 ✓）
+                               if (Diag.StructWriteKnownImpossible(objType.Name, fieldName))
+                               {
+                                   StatSkipped++;
+                                   Diag.StructSkipCacheHits++;   // ★ 只计数，**一行都不打**（I/O 才是大头）
+                               }
+                               else if (MiniLoader.StructSetterFix && Diag.TrySetStructViaProxy(obj, fieldName, keyData))
                             {
                                 StatSet++;
                             }
@@ -187,8 +228,8 @@ public static class WarpFunc
                             else
                             {
                                 StatSkipped++;
-                                SkipKeySamples.Add(objType.Name + "." + fieldName
-                                                       + "（内联值类型：代理 setter 不可用 → 跳过，见 [INL] 告警）");
+                                Diag.NoteSkipKey(objType.Name + "." + fieldName + "|内联值类型代理 setter 不可用");
+                        Diag.MarkStructWriteImpossible(objType.Name, fieldName);
                             }
 
                             continue;
@@ -217,7 +258,7 @@ public static class WarpFunc
                             else
                             {
                                 StatSkipped++;
-                                SkipKeySamples.Add(objType.Name + "." + fieldName + "（嵌套对象为 null 且新建失败）");
+                                Diag.NoteSkipKey(objType.Name + "." + fieldName + "|嵌套对象为 null 且新建失败");
                                 continue;
                             }
                         }
@@ -344,12 +385,17 @@ public static class WarpFunc
             catch (Exception inner)
             {
                 StatEx++;
+                Diag.NoteWarpLoopExit(objType.Name, "catch(异常被吞)", key, __i, __total);
                 // 无上限：异常采样全量记录 + 直接告警（零静默）
                 StatExSample.Add(objType.Name + "." + key + " → " + inner.GetType().Name + ": " + inner.Message);
                 Diag.NoteInlineIssue(objType.Name + "." + key + "|warp 异常",
                     inner.GetType().Name + " " + inner.Message);
             }
-        }
+        }   // ← 关闭 foreach (var key in __keys)
+            // ★ [WARP-LOOP] 无条件"循环走完"判据（不再依赖"最后一个键恰好是 WarpType 键"）
+            Diag.NoteWarpLoopDone(objType.Name, __i, __total, __last);   // ★ 每类首次一行 + 汇总（不再逐实例打 ✗）
+            if (false) MelonLogger.Msg("[WARP-LOOP] 循环结束: 宿主=" + objType.Name + " 处理=" + __i + "/总=" + __total
+                            + " 最后到达的键=" + __last);
     }
 
     // ═══════════ 纯托管值类型副本（boxed struct）：按**托管成员**逐键 warp ═══════════
@@ -379,8 +425,11 @@ public static class WarpFunc
         }
 
         var t = obj.GetType();
+        var __total = 0; foreach (var __k in json.Keys) __total++;   // [WARP-LOOP] 总键数（只读）
+        var __i = 0; var __last = "-";
         foreach (var key in json.Keys)
         {
+            __i++; __last = key;
             StatKeys++;
             try
             {

@@ -92,7 +92,12 @@ public static class MainGenTools
         }
 
         var valueTuples = MainGen.GetOrGen(baseObj.GetType());
-        if (!valueTuples.TryGetValue(fld, out var tuple)) return;
+        if (!valueTuples.TryGetValue(fld, out var tuple))
+        {
+            Diag.NoteSilentReturn("CommonSet", baseObj.GetType().Name, fld, "gen表无此字段");
+            Diag.TryResolveAndWriteMember(baseObj, fld, data?.ToString() ?? "");
+            return;
+        }
         if (tuple.isValueType)
         {
             // #2/#3 [掩盖审计] 值类型字段的**通用写入通道**（零裸内存、零静默）：
@@ -173,7 +178,12 @@ public static class MainGenTools
         where T : struct
     {
         var valueTuples = MainGen.GetOrGen(baseObj.GetType());
-        if (!valueTuples.TryGetValue(fld, out var tuple)) return;
+        if (!valueTuples.TryGetValue(fld, out var tuple))
+        {
+            // ★ [静默 return 显式化] gen 表无此字段时原来直接 return（黑箱 ✗）→ 现在显式上报（不再静默 ✓）。
+            Diag.NoteSilentReturn("CommonSetFldVal", baseObj.GetType().Name, fld, "gen表无此字段");
+            return;
+        }
         var objHandle = IL2CPP.Il2CppObjectBaseToPtrNotNull(baseObj);
         unsafe
         {
@@ -364,20 +374,39 @@ public static class MainGenTools
             var objHandle = IL2CPP.Il2CppObjectBaseToPtrNotNull(baseObj);
             // [FIX] 字段偏移必须按「字段宿主」的类型查，不能用元素类型 T 查（原来用 typeof(T) 永远查不到）
             var valueTuples = MainGen.GetOrGen(baseObj.GetType());
-            if (!valueTuples.TryGetValue(fld, out var tuple)) return;
+            if (!valueTuples.TryGetValue(fld, out var tuple))
+            {
+                // ★★ [静默 return 显式化 + 通解] gen 表无此字段时原来直接 return（黑箱 ✗）。
+                //    证据：`CardImage` gen 声明类型=UnityEngine.Sprite、JSON 有键、被调用、无拒绝/跳过/异常，复读仍 null ✗；
+                //    同形态 `CardBackground` 成功 ✓ ⇒ 卡在这个静默返回。必须尝试托管回退，不许提前返回 ✗。
+                Diag.NoteSilentReturn("SetByWarpper", baseObj.GetType().Name, fld, "gen表无此字段");
+                Diag.TryResolveAndWriteMember(baseObj, fld, warpData.ToString());
+                return;
+            }
             if (tuple.isValueType)
             {
                 // #3 [2026-10-03 掩盖审计] **删除裸指针写** `*(T*)(base+offset)=item`：
                 // 对含引用的内联结构写 8 字节指针会破坏内存，而且它掩盖了"结构字段没有安全写路径"。
-                // 统一走通解：代理 → warp → 属性 setter 整块写回；失败**打日志**（零静默）。
+                // 统一走通解：代理 → warp → 成员写回（属性优先、public 字段兜底）。
+                // 失败**去重计数**（`(类型.字段|原因) ×N` + 首次一行），**不再逐实例刷屏**
+                //（真机 95,180 行 / 30MB 日志就是这么来的；用户要求"按条件筛"，不是"按数量 cap"）。
                 if (!Diag.TrySetStructViaProxy(baseObj, fld, warpData))
-                    MelonLogger.Warning("[GEN] SetByWarpper 值类型字段写回失败（无可用属性 setter）: "
-                                        + baseObj.GetType().Name + "." + fld);
+                    Diag.NoteInlineIssue(baseObj.GetType().Name + "." + fld + "|SetByWarpper 结构写回失败",
+                        "属性与 public 字段都写不进（详见 [INL] 问题表）");
             }
             else
             {
                 IL2CPP.il2cpp_gc_wbarrier_set_field(objHandle, objHandle + tuple.fOffset,
                     IL2CPP.Il2CppObjectBaseToPtr((Il2CppObjectBase)(object)item));
+                // ★★ [对象身份 / 验证式回退] 写屏障之后**当场验证**：若字段仍为空 ⇒ 说明这次写没落到
+                //    游戏真正读取的那个对象/成员上（副本、代理包装、或成员落在别处）→ **必须**再走一次
+                //    托管成员通道（属性优先→public 字段，零裸内存）。真机证据：`CardImage` 复读恒 null ✗
+                //    而 `CardBackground` 正常 ✓ ⇒ 同形状不同结果，只能出在"写没落到真身"上。
+                Diag.NoteObjId("写", fld, baseObj);
+                if (Diag.IsNullAfterWrite(baseObj, fld) &&
+                    Diag.TryResolveAndWriteMember(baseObj, fld, warpData.ToString()))
+                    Diag.NoteObjId("写-回退后", fld, baseObj);
+
             }
         }
     }
