@@ -309,12 +309,13 @@ namespace CSTI_MiniLoader
         {
             try
             {
-                if (!_appended || _verified) return;
+                if (_verified) return;   // ★ 常开：不依赖 Diag_Phase2Append（让"空掉落表"可追踪）
                 if (Environment.TickCount64 - _appendedAt < 60000) return;
                 _verified = true;
 
                 var dict = MiniLoader.ItemDictionary(typeof(CardData));
                 int n = 0, idOk = 0, dropOk = 0;
+                var emptyList = new System.Collections.Generic.List<string>();
                 foreach (var kv in dict)
                 {
                     n++;
@@ -323,11 +324,13 @@ namespace CSTI_MiniLoader
                     if (!string.IsNullOrEmpty(id)) idOk++;
                     var dl = Diag.Member(o, "AllDrops");
                     if (dl != null && (int)Diag.ElemCount(dl) > 0) dropOk++;
+                    else emptyList.Add((Diag.NameOf(o) ?? kv.Key) + "(AllDrops=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()) + ")");
                     if (n <= 3)
                         MelonLogger.Warning("[PHASE2] 验证样本: " + (Diag.NameOf(o) ?? kv.Key) + " UniqueID=" + (id ?? "null")
                                             + " AllDrops=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()));
                 }
 
+                MelonLogger.Warning("[PHASE2] 空掉落表清单（无 cap）: " + string.Join(", ", emptyList));
                 MelonLogger.Warning("[PHASE2] 游戏自己 Init() 的验证: mod 卡=" + n + " UniqueID 非空=" + idOk
                                     + " AllDrops 非空=" + dropOk
                                     + (idOk > 0 ? "  ⇒ 游戏确实遍历并 Init 了" : "  ⇒ 未被 Init"));

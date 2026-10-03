@@ -60,7 +60,8 @@ namespace CSTI_MiniLoader
         public static void Tick()
         {
             Diag.Heartbeat();
-            try { PatchTest.Phase2Verify(); } catch { }   // [PHASE2] 只读验证（内部自带 60s 门与一次性标志）   // ★ 主线程停顿心跳（只在 >500ms 不推进时打一行）
+            try { PatchTest.Phase2Verify(); } catch { }
+            if (MiniLoader.InitDone) { try { DropsFix.RunAll("A:我们自己的Init之后"); } catch { } }   // [DROPSFIX] 时机 A   // [PHASE2] 只读验证（内部自带 60s 门与一次性标志）   // ★ 主线程停顿心跳（只在 >500ms 不推进时打一行）
             try
             {
                 if (!_probed) { _probed = true; ProbeFindApis(); }

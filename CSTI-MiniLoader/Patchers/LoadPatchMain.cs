@@ -436,6 +436,7 @@ public static class LoadPatchMain
             Diag.DumpSetFldRejects();            // [SETFLD] 写入被拒汇总（去重计数）
             Diag.DumpInlineIssues();             // [INL] 条件筛选：成功计数 + 失败去重计数（不刷屏、不 cap）
             Diag.DumpModCardImages();            // [CARDIMG] ★ 贴图回归判据：mod 卡面原生引用读数（null=红叉）
+            try { DropsFix.RunAll("B:warp+GSM 之后"); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [DROPSFIX] 时机 B（PC: DoWarpperLoader.cs:82/146/210）
             Diag.DumpModCardDefaults();         // [MODCARD-DEFAULT] 与游戏原生条目并排对比
             Diag.ApplyDragBisect();              // [DRAG-BISECT] 诊断二分开关（默认不限，零动作）
             Diag.DumpModCardInteractions();      // [MODCARD] 精灵卡交互 dump（用户级 bug 定案）
