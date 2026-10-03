@@ -1675,6 +1675,8 @@ public static class Diag
     public static int NameIndexMissReplay;
     /// <summary>[RESOLVE-TRACE/PATH] 只读追踪计数（各只打前 5 次）。</summary>
     public static int ResolveTraceCount, ResolvePathCount;
+    /// <summary>[RESOLVE-PATH] 已标记过的桶（按桶去重，避免被次数上限挡住）。</summary>
+    private static readonly HashSet<string> ResolvePathSeen = new();
     /// <summary>[NAMEIDX] 类型链级兜底（每级桶 miss 后补登记重试）的成功/尝试次数。</summary>
     public static int NameIndexChainReplay, NameIndexChainReplayOk;
 
@@ -3606,7 +3608,7 @@ public static class Diag
         where T : Il2CppObjectBase
     {
         // ★★ [RESOLVE-PATH · 只读] 标记本入口被走到（前 5 次）——用于点名真正处理 Cart 的路径。
-        try { if (ResolvePathCount < 5) { ResolvePathCount++; MelonLogger.Warning("[RESOLVE-PATH] 入口=ResolveByJsonForm<" + typeof(T).Name + ">（本入口被走到 ✓）"); } } catch { }
+        try { if (ResolvePathSeen.Add(typeof(T).Name)) { ResolvePathCount++; MelonLogger.Warning("[RESOLVE-PATH] 入口=ResolveByJsonForm<" + typeof(T).Name + ">（本入口被走到 ✓，按桶去重）"); } } catch { }
         item = null;
         if (string.IsNullOrEmpty(value)) return false;
         if (LooksLikeGuid(value))
