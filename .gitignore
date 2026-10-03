@@ -376,3 +376,16 @@ FodyWeavers.xsd
 *.DotSettings.user
 packages/
 
+.idea/
+bin/
+obj/
+*.dll
+*.apk
+*.so
+logs/
+temp/
+userlibs/
+results/
+_dumps/
+*.jks
+*.pem
