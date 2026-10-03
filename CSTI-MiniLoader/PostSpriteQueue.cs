@@ -12,6 +12,14 @@ namespace CSTI_MiniLoader
     ///   · flush 由我们**已有的 Tick 泵**驱动，**只执行队列**（逐条写回），**不做任何逻辑判断、不做时机猜测**；
     ///   · **默认关**（`cfg PostSpriteLoadQueue=true` 才启用），便于 A/B；全 try/catch、失败逐条告警。
     /// </summary>
+    // ★★ 实验结束（2026-10-03，Lead 裁定）：本通道 **默认永久关**，不要再启用 ★★
+    //  结论：**无收益**——同步 flush 后 [CARDIMG] 有CardImage=170 无CardImage=4，与不启用时完全一样。
+    //  失败原因（真机）：全部为"弱引用已死（宿主存活=False 值存活=True）字段=OverrideIcon"
+    //    ⇒ 队列宿主是 warp 期间的**临时对象**，到 flush 时已被回收 ⇒ 延迟写在移动端拿不到宿主。
+    //  真结论（保留价值）："时机错位"确实是上一轮"图片全丢（有CardImage=0 无CardImage=174）"的原因 ——
+    //    证据时间戳：[CARDIMG] 快照 15:49:59 早于 [POSTSPRITE] flush 15:50:22；
+    //    改成 warp/GSM 收尾同步 flush（[CARDIMG] 之前，15:54 版）后恢复到 170/174，但**仍无净收益**。
+    //  代码保留作档案（不再启用）；默认关 = 立即写 = 当前 170/174 可用状态。
     public static class PostSpriteQueue
     {
         public static int Enqueued, Flushed, FailedFlush;

@@ -732,3 +732,57 @@ $t = $asm.MainModule.GetType('UniqueIDScriptable')
 | 8 | 未提及 `WarpType` 0/1/2 是否实现 | **0/1/2 在 2.3.6.35 中未实现**（落到 `else` 报 `Unexpect WarpType`） | `[PC源码:WarpperFunction.cs:381-384]` |
 | 9 | 未提及 `CardData.FillDropsList()` 重跑 | 这是 PC 侧**唯一被显式重跑的"隐性步骤"**，对"数据写对就生效"的判断至关重要 | `[PC源码:LoaderUtil/DoWarpperLoader.cs:82, 146, 210]` |
 | 10 | 未提及 `plugins2` 与源码路径不匹配 | 2.3.6.35 **只读 `BepInEx\plugins`**，当前 F: 盘 `plugins2\` 布局不会被扫描 | 见本文 §0 |
+
+---
+
+## 14. 2026-10-03 实测结论（照 PC 三条通用通道的落地情况）
+
+### 14.1 `ArrayResize` 通道 —— **已等价实现** ✓（不是根因）
+* 现状：`SetArrNoWarpper`（`MainGenTools.cs`）本身即 PC `WarpperFunction.cs:570 ArrayResize` 的等价实现：
+  读旧数组 → `Array.CreateInstance(elem, old+N)` → 逐元素复制（保原引用）→ 尾部追加 → 整块写回。`ADD_REFERENCE` 的
+  "只追加已存在引用、不新建对象"语义由 `warpType != ADD_REFERENCE` 判定（`MainGenTools.cs:597`）保证。
+* 第 A 轮（拆裸写）：原 `SetArrByWarpper` 里 `il2cpp_array_new` + "数组头偏移直接写槽位"（裸内存）→ 换成与 `:867`
+  同款的纯托管写法（`Array.CreateInstance` + `SetValue` + 写屏障）。真机验证通过。
+* 第 B 轮（口径）：在 `SetArrNoWarpper` 内接上 `[ARRAYRESIZE]` 计数与日志（不重构路径）。
+* **真机判据**：`[ARRAYRESIZE] 扩容追加=64 失败=0 就地改=11`、引用保留 2/2、六项判据全绿 ⇒ **该通道健康，不是拖拽根因**。
+* **"被替换 7"与本通道无关**：第 B 轮 diff 仅新增日志/计数（零写入路径改动）；且 A 轮验证时即为
+  `451289 中保留 451282（被替换 7）`，与既有残留一致、未恶化 ⇒ 7 处替换另有来源，非本通道引入。
+
+### 14.2 `模式=ADD_REFERENCE` 命中 0 行 —— **待查（低优先）**
+* GSM 侧存在 3 处 `WarpType=ADD_REFERENCE`，但 `[ARRAYRESIZE] 模式=ADD_REFERENCE` 未出现。
+* 可能原因（未验证）：那 3 处落在"无字段变化"分支、或走了 `SetLiByWarpper`/其它分支。
+* 裁定：**暂不追**，留作低优先项。
+
+### 14.3 `PostSpriteLoad` 延迟落盘 —— **实验结束、默认永久关、无收益**
+* 复刻语义：`PostSpriteQueue.Enqueue`（warp 时入队）+ `Flush`（Tick 泵 / warp 收尾同步）；cfg `PostSpriteLoadQueue=true` 才启用。
+* 第一轮（Tick 泵 flush）：`[POSTSPRITE] 入队=319 flush=286 失败=33`，`[CARDIMG] 有CardImage=0 无CardImage=174`
+  （**图片全丢**）。原因 = **时机错位**：`[CARDIMG]` 快照 `15:49:59` 早于 `[POSTSPRITE] flush 15:50:22`
+  ⇒ 队列值在游戏读取之后才写入、再没机会生效。PC 的 `CompressOnLate` 是 loader 自己阶段里的协程（早于游戏读取）。
+* 第二轮（改同步 flush，位置在 `LoadPatchMain` 的 `[CARDIMG]` 之前）：恢复 `170/174`，但**与不启用时完全一样 ⇒ 无净收益**。
+* 失败原因分布：全部为"弱引用已死（宿主存活=False 值存活=True）字段=`OverrideIcon`"
+  ⇒ 队列宿主是 **warp 期间的临时对象**，flush 前已被回收 ⇒ 延迟写在移动端拿不到宿主。
+* 裁定：**默认永久关**（当前默认即关 = 立即写 = `170/174` 可用状态）；代码保留作档案，**不再启用**。
+
+### 14.4 `[PHASE2-ORIG]` 原版对照锚点问题
+* 判定"26 张空掉落表本来就无掉落 vs 应有而无"时，按英文名去前缀找原版同类卡：结果 `找不到原版=100`
+  ⇒ **锚点错误**：原版卡名是**本地化中文名**，按英文名查找必然落空。
+* 正确锚点应为 `CardData.CardModel` / `CardType` 或同类原版卡的判定字段（未实施，留作低优先）。
+* 相关：`FillDropsList()` 双时机重跑（`DropsFix.cs`，默认开）已把 `AllDrops 非空` 从 **74 → 148**；`AllDrops` 是掉落来源型字段，
+  上述 26 张多为非掉落来源卡。
+
+### 14.5 注册时机（"创建提前"）—— **独立课题**（证据：`append=0`）
+* 目标（照 PC `ModLoader.cs:852`）：在 `UniqueIDScriptable.ClearDict` 前缀里把 mod 对象 append 进
+  `GameLoad.Instance.DataBase.AllData`，让游戏自己的循环调 `Init()`（我们不自己调、不轮询）。
+* 实测：`[PHASE2] 已 append 进 AllData: 成功=0 跳过=0 之后 AllData.Count=2858`
+  ⇒ **那一刻我们的对象还不存在**（时间线：我们 init 15:21:26 → 游戏 `ClearDict` 15:21:30 → mod 对象创建完成 15:21:49）
+  ⇒ 窗口存在（≈4 秒），但我们的流水线把"创建"排在重活（名字索引 4~6s、图集/61 sprite 4~8s、等注册表就绪的 deferred-init）之后。
+* 裁定：**留作独立课题**（需把 create/warp 压进 `ClearDict` 之前的窗口；重排单独一轮、只带 `[PHASE-ORDER]` 计时）。
+* 既有 `[PHASE-ORDER]` 时间线：`t0=melon init` / `t1=ClearDict 前缀开始` / `t2=我们自己的 Init 完成` / `t3=append 完成` / `t4=游戏 Init 之后`。
+
+### 14.6 PC 侧三条通用通道的最终状态
+| # | PC 机制 | 我们的状态 | 结论 |
+|---|---|---|---|
+| 1 | `ArrayResize` 原地扩容 + `ObjectAddReferenceWarpper` 追加语义 | **已等价实现**（A/B 两轮 + 真机判据全绿） | 不是拖拽根因 |
+| 2 | `PostSpriteLoad` 延迟落盘 | 已复刻但**无收益**（宿主弱引用在 flush 前回收） | **实验结束、默认永久关** |
+| 3 | 按字段类型的引用字典分层 | 部分（mod 字典 + 游戏注册表 + 名字索引） | 待评估（未做） |
+
