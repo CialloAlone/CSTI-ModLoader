@@ -1510,6 +1510,7 @@ public static class Diag
             parts.Add(t + "=" + (NameIndex.TryGetValue(t, out var d) ? d.Count : 0));
         MelonLogger.Msg("[NAMEIDX] 单遍建索引完成: 扫描对象=" + scanned + " 按类跳过=" + skipped
                         + " 耗时=" + (Environment.TickCount - t0) + "ms | " + string.Join(" ", parts));
+        ReapplyNameRegistrations(null);   // [NAMEIDX] 构建后重放 mod 登记（否则惰性构建会覆盖）
     }
 
     private static bool ClassCouldHoldAny(Type cls)
@@ -1783,6 +1784,32 @@ public static class Diag
         catch { }
     }
 
+    /// <summary>`[NAMEIDX]` 我们登记过的 mod 资产（桶,名字,对象）——索引是**惰性构建**的，构建后必须重放，
+    /// 否则 mod 自建 sprite 会被"构建"覆盖掉（真机：DarthNihilus_Cart 图已登记但 warp 时查不到）。</summary>
+    private static readonly List<(string Bucket, string Name, object Obj)> RegisteredNameQueue = new();
+
+    /// <summary>索引构建后重放我们的登记（bucket 为空 = 全部桶）；只读语义、幂等。</summary>
+    public static void ReapplyNameRegistrations(string bucket)
+    {
+        try
+        {
+            var n = 0;
+            foreach (var (b, nm, o) in RegisteredNameQueue)
+            {
+                if (bucket != null && b != bucket) continue;
+                if (o == null || string.IsNullOrEmpty(nm)) continue;
+                if (!NameIndex.TryGetValue(b, out var d) || d == null) { d = new Dictionary<string, object>(); NameIndex[b] = d; }
+                d[nm] = o;
+                n++;
+            }
+            if (n > 0) MelonLogger.Msg("[NAMEIDX] 索引构建后重放 mod 登记=" + n + "（桶=" + (bucket ?? "全部") + "）");
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Warning("[NAMEIDX] 重放失败: " + e.GetType().Name + " " + e.Message);
+        }
+    }
+
     public static void NoteNameIndex(string bucket, string name, object obj)
     {
         try
@@ -1797,6 +1824,7 @@ public static class Diag
 
             if (d.ContainsKey(name)) return;   // 已存在（游戏资产优先）→ 不覆盖
             d[name] = obj;
+            try { if (!RegisteredNameQueue.Any(t => t.Bucket == bucket && t.Name == name)) RegisteredNameQueue.Add((bucket, name, obj)); } catch { }
             NameIndexRegistered++;
             MelonLogger.Msg("[NAMEIDX] 注册(mod sprite): 名=" + name + " 桶=" + bucket
                             + " 累计=" + NameIndexRegistered);
@@ -1919,6 +1947,7 @@ public static class Diag
         MelonLogger.Msg("[NAMEIDX] " + typeName + " 扫描对象=" + scanned + " 建索引=" + added
                         + " 冲突=" + conflict + " 耗时=" + (Environment.TickCount - t0) + "ms"
                         + (added > 0 ? " ✓ 可按名解析" : "（未找到此类型的引用源）"));
+        ReapplyNameRegistrations(typeName);   // [NAMEIDX] 构建后重放 mod 登记（否则惰性构建会覆盖）
     }
 
     /// <summary>名字索引扫描预算（防止深下探把加载时间拖长）。</summary>
