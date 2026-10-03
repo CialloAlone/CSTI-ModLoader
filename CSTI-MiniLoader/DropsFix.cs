@@ -51,7 +51,6 @@ namespace CSTI_MiniLoader
 
                 var dict = MiniLoader.ItemDictionary(typeof(CardData));
                 int n = 0, beforeEmpty = 0;
-                string cmState = "?";
                 foreach (var kv in dict)
                 {
                     n++;
@@ -60,7 +59,6 @@ namespace CSTI_MiniLoader
                     if (o == null) continue;
 
                     var dl = Diag.Member(o, "AllDrops");
-                    if (n == 1) cmState = Diag.Member(o, "CardModel") == null ? "null" : "非null";
                     if (n == 1 && phase.StartsWith("B"))
                         MelonLogger.Warning("[DROPSFIX] 时机=B 前置: CardModel=" + (Diag.Member(o, "CardModel") == null ? "null" : "非null")
                                             + " AllDrops.Length=" + (dl == null ? "null" : Diag.ElemCount(dl).ToString()));   // 只读
@@ -86,7 +84,7 @@ namespace CSTI_MiniLoader
 
                 MelonLogger.Warning("[DROPSFIX] 时机=" + phase + " 卡=" + n + " 重跑前 AllDrops 空=" + beforeEmpty
                                     + " 已调用=" + Tried + " 之后非空=" + Filled + " 调用失败=" + FailedCall
-                                    + " CardModel=" + cmState);
+);
             }
             catch (Exception e)
             {
