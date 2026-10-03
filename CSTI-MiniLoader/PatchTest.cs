@@ -13,7 +13,7 @@ namespace CSTI_MiniLoader
     /// Phase1 探针 + Phase2 通道（**全部默认关**；cfg 控制；只读枚举不挂任何钩子）。
     ///  · Diag_PatchTargets = true → 只枚举并打印真实方法签名（零 Hook）
     ///  · Diag_PatchTest    = true → 只挂 UniqueIDScriptable.ClearDict 一个（前缀只打点 + 只读判据）
-                if (!Flag("Diag_Phase2Append").Contains("false")) Phase2Append();   // 默认开（cfg=false 可关）
+    ///  · Diag_Phase2Append = true → 在 ClearDict 前缀里照 PC（ModLoader.cs:852）把 mod 对象 append 进 AllData，
     ///                              让游戏自己的循环替我们调 Init()（**我们不自己调、不轮询**）；60 秒后只读验证。
     /// </summary>
     public static class PatchTest
@@ -229,7 +229,7 @@ namespace CSTI_MiniLoader
             try
             {
                 Calls++;
-                if (Calls == 1) Diag.PhaseMark("t1=ClearDict 前缀开始");   // [PHASE-ORDER]
+                if (Calls == 1) Diag.PhaseMark("t1=ClearDict 前缀开始");
                 if (Calls <= 3)
                 {
                     MelonLogger.Warning("[PATCH-TEST] " + TargetType + "." + TargetMethod + " 首次调用=是 次数=" + Calls);
@@ -247,7 +247,7 @@ namespace CSTI_MiniLoader
                     }
                 }
 
-                if (!Flag("Diag_Phase2Append").Contains("false")) Phase2Append();   // ★ 默认开（用户裁定：注册时机要趁早）
+                if (!Flag("Diag_Phase2Append").Contains("false")) Phase2Append();   // 默认开（cfg=false 可关）
             }
             catch { }
         }
@@ -284,7 +284,6 @@ namespace CSTI_MiniLoader
                     }
                 }
 
-                Diag.PhaseMark("t3=append 完成 成功=" + Appended);   // [PHASE-ORDER]
                 MelonLogger.Warning("[PHASE2] 已 append 进 AllData: 成功=" + Appended + " 跳过=" + AppendedSkipped
                                     + " 之后 AllData.Count=" + Diag.ElemCount(allData));
             }
@@ -314,7 +313,6 @@ namespace CSTI_MiniLoader
                 if (_verified) return;   // ★ 常开：不依赖 Diag_Phase2Append（让"空掉落表"可追踪）
                 if (Environment.TickCount64 - _appendedAt < 60000) return;
                 _verified = true;
-                Diag.PhaseMark("t4=游戏 Init 之后（只读验证点）");   // [PHASE-ORDER]
 
                 var dict = MiniLoader.ItemDictionary(typeof(CardData));
                 int n = 0, idOk = 0, dropOk = 0;
