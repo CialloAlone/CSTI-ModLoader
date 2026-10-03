@@ -1647,6 +1647,8 @@ public static class Diag
     /// </summary>
     // ═══════════ ★ 名字索引"登记"通道（mod 自建资产也要能被自己引用） ═══════════
     public static int NameIndexRegistered;
+    /// <summary>[NAMEIDX] 查找 miss 触发"补登记后重查"的次数（幂等兜底；实证：Cart 在 warp 时被重建吃掉登记）。</summary>
+    public static int NameIndexMissReplay;
 
     /// <summary>
     /// 把一个**我们自建的资产**（例如 mod 图集抠出来的 `Sprite`）登记进名字索引 —— 否则它只在 mod 私有
@@ -1876,6 +1878,32 @@ public static class Diag
                 if (ci2 != null) return ci2;
             }
         }
+
+        // ★★ [NAMEIDX 兜底 · 2026-10-03 实证] 查找 miss → ReapplyNameRegistrations(typeName) 一次 → 再查一次。
+        //    实证：Cart 在 warp 时未命中（[RESOLVE] 未解析 值=Cart 目标类型=Sprite），而几毫秒后 [MISSIMG] 命中 mod图集
+        //    ⇒ 索引被惰性重建"吃掉"过我们的登记。此处幂等补登记；只在 miss 时执行、命中路径零开销、不改写入行为。
+        try
+        {
+            ReapplyNameRegistrations(typeName);
+            NameIndexMissReplay++;
+            if (NameIndex.TryGetValue(typeName, out var d3))
+            {
+                if (d3.TryGetValue(name, out var o3))
+                {
+                    MelonLogger.Msg("[NAMEIDX] miss 触发补登记=" + NameIndexMissReplay + " 桶=" + typeName + " 名字=" + name + "（补登记后命中 ✓）");
+                    return o3;
+                }
+                var ci3 = FindLoose(d3, name, typeName);
+                if (ci3 != null)
+                {
+                    MelonLogger.Msg("[NAMEIDX] miss 触发补登记=" + NameIndexMissReplay + " 桶=" + typeName + " 名字=" + name + "（宽松匹配后命中 ✓）");
+                    return ci3;
+                }
+            }
+            if (NameIndexMissReplay <= 5)
+                MelonLogger.Warning("[NAMEIDX] miss 触发补登记=" + NameIndexMissReplay + " 桶=" + typeName + " 名字=" + name + "（补登记后仍未命中）");
+        }
+        catch { }
 
         return null;
     }
