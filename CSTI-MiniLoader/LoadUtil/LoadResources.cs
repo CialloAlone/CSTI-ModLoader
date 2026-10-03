@@ -431,6 +431,9 @@ public static class LoadResources
     public static void WarpperAllEditorGameSrouces()
     {
             try { Diag.PhaseMarkOnce("[ANCHOR] WarpperAllEditorGameSrouces 入口（warp 内候选）"); } catch { }
+            // ★★ [NAMEIDX 修复] 已实证锚点（真机 [ANCHOR] t=118968ms 确认真执行）⇒ 在此重放 mod 登记：
+            //    重放后名字索引里就会有 mod 自建 sprite，warp 解析引用时即可命中（顺序无关登记）。
+            try { Diag.ReplayTrigger = "WarpperAll 入口"; Diag.ReapplyNameRegistrations(null); } catch (Exception __e) { MelonLogger.Warning("[LoadResources] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
         // var bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
         //foreach (var item in WaitForWarpperEditorGameSourceGUIDList)
         while (WaitForWarpperEditorGameSourceGUIDList.Count > 0)

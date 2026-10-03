@@ -441,7 +441,8 @@ public static class LoadPatchMain
             //    PC 的 CompressOnLate 是 loader 自己阶段里的协程（早于游戏读取）；我们改为"warp/GSM 收尾同步 flush"。
             try { PostSpriteQueue.Flush(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }
             Diag.DumpModCardImages();            // [CARDIMG] ★ 贴图回归判据：mod 卡面原生引用读数（null=红叉）
-            try { MissingImgProbe.Run(); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [MISSIMG] 只读缺图点名（零行为改动）
+            try { MissingImgProbe.Run(); } catch (Exception __e0) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e0.GetType().Name + " " + __e0.Message); }
+            try { NameStyleProbe.Run(); } catch (Exception __e1) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e1.GetType().Name + " " + __e1.Message); }   // [NAMESTYLE] 只读 catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [MISSIMG] 只读缺图点名（零行为改动）
             try { DropsFix.RunAll("B:warp+GSM 之后"); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [DROPSFIX] 时机 B（PC: DoWarpperLoader.cs:82/146/210）
             try { PatchTest.Phase2Verify(true); } catch (Exception __e) { MelonLogger.Warning("[LoadPatchMain] 异常(已记录): " + __e.GetType().Name + " " + __e.Message); }   // [PHASE2] 加载完成即验
             Diag.DumpModCardDefaults();         // [MODCARD-DEFAULT] 与游戏原生条目并排对比
